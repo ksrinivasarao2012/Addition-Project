@@ -1,6 +1,6 @@
 cd C:\Users\heman\Music\rl_imu_project
-carla_env\Scripts\activate
-pip install torch numpy pandas matplotlib
+carla_env37\Scripts\activate
+pip install torch numpy pandas matplotlib scipy
 python lstm\train_lstm.py
 
 

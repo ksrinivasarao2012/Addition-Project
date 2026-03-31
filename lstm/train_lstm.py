@@ -1,836 +1,850 @@
 """
-train_lstm.py  —  LSTM Drift Compensator  (v2)
-================================================
+train_lstm.py  —  LSTM Drift Predictor for RL-Adaptive EKF  (v3 Final)
+=======================================================================
+For: LSTM + RL-Adaptive EKF Localization Project
 
-PURPOSE
--------
-Train an LSTM that predicts vehicle 2-D displacement (Δx, Δy) over a
-2.5-second window of IMU + derived features.
+What This LSTM Learns
+---------------------
+During GPS denial (tunnel), the EKF has no measurement update and
+relies entirely on IMU dead-reckoning, which drifts. The LSTM learns
+to predict the TRUE forward and lateral acceleration one step ahead,
+given the last 2 seconds of IMU history. This replaces the raw noisy
+IMU reading inside the EKF predict() step during tunnel traversal.
 
-During GPS denial (Town04 tunnel) the Kalman Filter loses its measurement
-correction step and position error accumulates.  The KF-LSTM fusion module
-calls this model every tick to estimate how far the vehicle moved, so the
-KF position estimate can be corrected even without GPS.
+  Inputs  (5 features, SEQ_LEN=40 steps = 2.0 seconds of history):
+    ax_corr        gravity-corrected forward accel   (m/s²)
+    ay_corr        gravity-corrected lateral accel   (m/s²)
+    wz             yaw rate from IMU gyroscope       (rad/s)
+    gt_speed_mps   vehicle speed                     (m/s)
+    gps_denied     GPS denial flag (0 or 1)
 
-WHY EACH DESIGN DECISION WAS MADE
------------------------------------
+  Why gps_denied as input:
+    The LSTM modulates its predictions differently in tunnels
+    (pure IMU mode) vs open road (GPS-corrected mode). Without
+    this flag, the LSTM cannot distinguish these contexts.
 
-sin(yaw) / cos(yaw)  [ADDED]
-    Raw ax, ay are in the vehicle body frame.  Without heading the network
-    must infer the body→world rotation implicitly from the gyro sequence.
-    Adding sin/cos of heading gives it that rotation explicitly.
-    sin/cos is used instead of raw yaw to avoid the ±π discontinuity.
-    During training  : yaw derived from consecutive gt_x, gt_y positions.
-    During inference : yaw taken from the KF state estimate.
+  Outputs (2 targets, 1 step ahead = 0.05s):
+    gt_accel_fwd_mps2   true forward  accel (zero-phase filtered)
+    gt_accel_lat_mps2   true lateral  accel (zero-phase filtered)
 
-a_horiz = sqrt(ax²+ay²)  [ADDED]
-    Horizontal acceleration magnitude with gravity removed.
-    az ≈ 9.8 m/s² always in CARLA (gravity not subtracted by the sensor),
-    so a_mag = sqrt(ax²+ay²+az²) ≈ 9.8 always and is nearly uninformative.
-    a_horiz isolates the lateral/longitudinal dynamics that actually matter.
+Architecture  (v3 — right-sized for 17,960 training sequences)
+--------------------------------------------------------------
+  Input(5) → LayerNorm → LSTM(64) → LayerNorm → Dropout(0.3)
+           → LSTM(32)  → LayerNorm → Dropout(0.3) → last step
+           → Linear(32→16) → GELU → Linear(16→2)
 
-gyro_mag = sqrt(wx²+wy²+wz²)  [ADDED]
-    Rotation-invariant scalar summary of how fast the vehicle is turning.
-    Useful for distinguishing straight segments from corners.
+  Params: ~31,000   Sequences: ~17,960   Ratio: ~0.57  ← good fit
 
-delta_speed  [ADDED]
-    speed[t] − speed[t−1].  Longitudinal acceleration proxy without needing
-    to integrate IMU.  First sample is set to 0.
+Fixes from v2
+-------------
+  FIX 1  — Cross-run target leakage: boundary check now includes the
+            target step (run_ids[end] instead of run_ids[end-1]).
+            Previously the last input step of Run N and the first row
+            of Run N+1 could be paired as (sequence, target), causing
+            gradient spikes once per run boundary.
+  FIX 2  — LayerNorm / Dropout order swapped: LN now runs on the
+            stable LSTM output BEFORE dropout, not after. Dropout
+            randomly zeros + rescales activations, making variance
+            fluctuate wildly; LN after dropout was normalising a
+            corrupted distribution. Correct order: LN → Dropout.
 
-SmoothL1Loss (Huber)  [ADDED, replaces MSELoss]
-    CARLA IMU spikes on kerb hits, hard braking, and lane transitions.
-    Under MSE a single spike dominates the batch gradient (squared penalty).
-    Huber is quadratic for |error| < 1 and linear for larger errors,
-    so outliers have bounded influence on training.
+Fixes carried from v2
+---------------------
+  v2-FIX 1  — gps_denied added as 5th input feature
+  v2-FIX 2  — SEQ_LEN 20→40  (1s→2s context)
+  v2-FIX 3  — Model 120K→31K params (right-sized for dataset)
+  v2-FIX 4  — LayerNorm after each LSTM layer (training stability)
+  v2-FIX 5  — AdamW instead of Adam (proper weight decay)
+  v2-FIX 6  — Target normalisation inside Dataset (not fragile loop)
+  v2-FIX 7  — Tunnel-only evaluation (primary project metric)
+  v2-FIX 8  — verbose=True removed from ReduceLROnPlateau (deprecated)
+  v2-FIX 9  — torch.manual_seed + np.random.seed (reproducibility)
+  v2-FIX 10 — NUM_LAYERS, PRED_HORIZON removed (defined but never used)
+  v2-FIX 11 — Tunnel weight 3.0→2.0 (less aggressive, better balance)
+  v2-FIX 12 — Print every epoch (full visibility)
+  v2-FIX 13 — Scatter plot subsampled to 2000 pts (fast rendering)
+  v2-FIX 14 — GELU instead of ReLU in head (smoother for regression)
 
-STRIDE = 10  [CHANGED from 5]
-    STRIDE=5 means 90% window overlap → highly correlated consecutive samples
-    → validation loss appears smoother than it truly is.
-    STRIDE=10 halves the overlap while keeping ≈2400 usable windows from a
-    20-minute collection.
-
-Unidirectional LSTM  [KEPT — bidirectional rejected]
-    A bidirectional LSTM reads the window both forward and backward before
-    producing output.  It therefore cannot emit a prediction until it has seen
-    the entire window, i.e. it imposes a mandatory SEQ_LEN-step (2.5 s) delay.
-    The KF-LSTM fusion module calls the model every CARLA tick.  A 2.5-second
-    frozen correction window defeats the purpose of real-time fusion.
-
-Δt not added  [REJECTED]
-    CARLA runs in synchronous mode with fixed_delta_seconds=0.05.  Every tick
-    is exactly 0.05 s by the simulator engine — there is no jitter.
-    A constant column of 0.05 adds zero information.  Valid for real hardware.
-
-Predict (Δx, Δy)  [KEPT — (distance, heading_change) rejected]
-    Converting (distance, heading_change) → (Δx, Δy) at inference requires
-    the absolute heading at the start of every window as external decoding
-    context, creating a circular dependency with the KF state.
-    Direct (Δx, Δy) in the local coordinate frame is already well-bounded
-    (≈ ±30 m at highway speed) and the target distribution is smooth.
-
-FEATURE SET  (12 features, INPUT_SIZE = 12)
---------------------------------------------
-  0  ax          linear acceleration x           m/s²
-  1  ay          linear acceleration y           m/s²
-  2  az          linear acceleration z           m/s²  (includes ~9.8 gravity)
-  3  wx          angular velocity x              rad/s
-  4  wy          angular velocity y              rad/s
-  5  wz          angular velocity z              rad/s  (yaw rate)
-  6  speed_mps   vehicle speed                   m/s
-  7  sin_yaw     sin of heading angle            —
-  8  cos_yaw     cos of heading angle            —
-  9  a_horiz     sqrt(ax²+ay²)                   m/s²
- 10  gyro_mag    sqrt(wx²+wy²+wz²)               rad/s
- 11  delta_spd   speed[t] − speed[t−1]           m/s
-
-RUN
----
-    cd C:\\Users\\heman\\Music\\rl_imu_project
-    carla_env\\Scripts\\activate
-    pip install torch numpy pandas matplotlib
-    python lstm\\train_lstm.py
-
-OUTPUTS
--------
-    models/lstm_drift.pt            model weights + saved hyperparameters
-    models/lstm_norm_params.npz     per-feature mean & std  (required at inference)
-    models/lstm_training_log.csv    loss / rmse / lr per epoch
-    plots/lstm_training_curves.png  Huber loss + val-RMSE over epochs
-    plots/lstm_test_predictions.png 4-panel diagnostic on held-out test split
-
-INFERENCE CHECKLIST
--------------------
-    At inference time, before feeding a window to the model:
-
-    1. Compute yaw from KF state:
-           sin_yaw_i  = sin(kf_yaw)  for each step i in the window
-           cos_yaw_i  = cos(kf_yaw)
-
-    2. Compute derived features per step:
-           a_horiz_i  = sqrt(ax_i² + ay_i²)
-           gyro_mag_i = sqrt(wx_i² + wy_i² + wz_i²)
-           delta_spd_i = speed_i − speed_{i−1}  (0 for the first step)
-
-    3. Assemble (SEQ_LEN, 12) float32 array in FEATURE_COLS order.
-
-    4. Load lstm_norm_params.npz, apply:
-           x_norm = (x − mean) / std
-
-    5. Call model.forward(torch.from_numpy(x_norm).unsqueeze(0))
-       Output is (1, 2) → (Δx, Δy) in metres.
+Output
+------
+  models/lstm_drift_predictor.pth     trained model weights + metadata
+  models/lstm_normalisation.npz       normalisation stats for EKF bridge
+  results/lstm_training.png           5-panel results plot
+  results/lstm_metrics.txt            full metrics including tunnel-only
 """
 
-# ── standard library ──────────────────────────────────────────────────────────
 import os
-import sys
-import time
-import csv
-
-# ── third-party ───────────────────────────────────────────────────────────────
+import random
 import numpy as np
 import pandas as pd
-
-# Non-interactive backend must be set before any pyplot import
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
-
+import matplotlib.gridspec as gridspec
 import torch
 import torch.nn as nn
+import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   CONFIGURATION  —  edit only this block
-# ══════════════════════════════════════════════════════════════════════════════
-
-BASE_DIR  = r'C:\Users\heman\Music\rl_imu_project'
-DATA_CSV  = os.path.join(BASE_DIR, 'data', 'town04_collected.csv')
-MODEL_DIR = os.path.join(BASE_DIR, 'models')
-PLOT_DIR  = os.path.join(BASE_DIR, 'plots')
-
-# Columns that must exist in the raw CSV
-RAW_COLS = ['timestamp', 'ax', 'ay', 'az', 'wx', 'wy', 'wz',
-            'speed_mps', 'gt_x', 'gt_y', 'gps_denied']
-
-# Feature columns fed to the model — order matters for norm params
-FEATURE_COLS = [
-    'ax', 'ay', 'az',
-    'wx', 'wy', 'wz',
-    'speed_mps',
-    'sin_yaw', 'cos_yaw',
-    'a_horiz',
-    'gyro_mag',
-    'delta_spd',
-]
-INPUT_SIZE = len(FEATURE_COLS)   # 12
-
-# Windowing
-SEQ_LEN = 50    # window length  : 50 × 0.05 s = 2.5 s
-STRIDE  = 10    # window step    : 10 × 0.05 s = 0.5 s  →  80% overlap
-
-# Model
-HIDDEN_SIZE = 128
-NUM_LAYERS  = 2
-DROPOUT     = 0.2
-
-# Training
-BATCH_SIZE  = 256
-EPOCHS      = 100
-LR_INIT     = 1e-3
-LR_MIN      = 1e-6
-LR_FACTOR   = 0.5   # multiply LR when val loss stops improving
-LR_PATIENCE = 8     # epochs before LR drop
-ES_PATIENCE = 20    # epochs before early stop
-
-# Data split — time-ordered, no shuffling across boundaries
-VAL_FRAC  = 0.15
-TEST_FRAC = 0.10
-
+# =============================================================================
+# REPRODUCIBILITY
+# =============================================================================
 SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark     = False
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   DATASET
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# PATHS
+# =============================================================================
+DATA_PATH    = r'C:\Users\heman\Music\rl_imu_project\data\town04_dataset.csv'
+MODEL_DIR    = r'C:\Users\heman\Music\rl_imu_project\models'
+RESULTS_DIR  = r'C:\Users\heman\Music\rl_imu_project\results'
+MODEL_PATH   = os.path.join(MODEL_DIR,   'lstm_drift_predictor.pth')
+STATS_PATH   = os.path.join(MODEL_DIR,   'lstm_normalisation.npz')
+PLOT_PATH    = os.path.join(RESULTS_DIR, 'lstm_training.png')
+METRICS_PATH = os.path.join(RESULTS_DIR, 'lstm_metrics.txt')
 
-class DisplacementDataset(Dataset):
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# ── Sequence ──────────────────────────────────────────────────────────────────
+SEQ_LEN = 40    # 40 × 0.05s = 2.0 seconds of context
+STRIDE  = 2     # stride-2 prevents excessive overlap, halves dataset redundancy
+
+# ── Features / targets ────────────────────────────────────────────────────────
+FEATURE_COLS = ['ax_corr', 'ay_corr', 'wz', 'gt_speed_mps', 'gps_denied']
+TARGET_COLS  = ['gt_accel_fwd_mps2', 'gt_accel_lat_mps2']
+
+# ── Data split: by run to prevent leakage ─────────────────────────────────────
+TRAIN_RUNS = [0, 1, 2]   # 18,000 rows
+VAL_RUNS   = [3]          # 6,000 rows → first 3,000 val, last 3,000 test
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+HIDDEN1 = 64
+HIDDEN2 = 32
+DROPOUT = 0.3
+
+# ── Training ──────────────────────────────────────────────────────────────────
+BATCH_SIZE    = 128
+LEARNING_RATE = 5e-4
+WEIGHT_DECAY  = 1e-4
+NUM_EPOCHS    = 150
+PATIENCE      = 20       # early stopping patience
+TUNNEL_WEIGHT = 2.0      # loss multiplier for tunnel sequences
+GRAD_CLIP     = 1.0
+LR_PATIENCE   = 8
+LR_FACTOR     = 0.5
+LR_MIN        = 1e-6
+
+# ── Input clipping (ax_corr had outlier at -27.4 in the data) ─────────────────
+INPUT_CLIP = {
+    'ax_corr':      (-20.0, 20.0),
+    'ay_corr':      (-15.0, 15.0),
+    'wz':           (-5.0,   5.0),
+    'gt_speed_mps': (0.0,   35.0),
+    'gps_denied':   (0.0,    1.0),   # already 0/1, clip is a safety net
+}
+
+
+# =============================================================================
+# DATA PREPROCESSOR
+# =============================================================================
+
+class DataPreprocessor:
     """
-    Wraps normalised (X, y) arrays as a PyTorch Dataset.
+    Loads, cleans, clips, and normalises the collected CSV data.
 
-    X : float32 ndarray  (N, SEQ_LEN, INPUT_SIZE)
-    y : float32 ndarray  (N, 2)   —  (Δgt_x, Δgt_y) in metres
+    Rules:
+      - Normalisation statistics computed on TRAINING data ONLY.
+      - Features normalised with z-score (mean=0, std=1).
+      - Targets normalised with z-score (so MSE loss is not dominated
+        by whichever target has the larger physical range).
+      - gps_denied is NOT normalised (already 0/1; z-scoring it would
+        hurt the LSTM's ability to use it as a context switch).
     """
 
-    def __init__(self, X: np.ndarray, y: np.ndarray) -> None:
-        # Convert once at construction — avoids per-item tensor allocation
-        self.X = torch.from_numpy(X)
-        self.y = torch.from_numpy(y)
+    def __init__(self):
+        self.feat_mean = None
+        self.feat_std  = None
+        self.tgt_mean  = None
+        self.tgt_std   = None
 
-    def __len__(self) -> int:
+    def load_and_clean(self, path):
+        df = pd.read_csv(path)
+        n0 = len(df)
+
+        # Drop NaN rows (from dropped frames during collection)
+        needed = FEATURE_COLS + TARGET_COLS + ['run_id', 'timestamp']
+        df = df.dropna(subset=needed).reset_index(drop=True)
+        if len(df) < n0:
+            print(f"  Dropped {n0 - len(df)} NaN rows")
+
+        # Clip outlier inputs; gps_denied is naturally 0/1, skip it
+        for col, (lo, hi) in INPUT_CLIP.items():
+            before_max = df[col].abs().max()
+            df[col] = df[col].clip(lo, hi)
+            if before_max > hi * 1.01:
+                print(f"  Clipped {col}: was ±{before_max:.2f}, "
+                      f"now ±{df[col].abs().max():.2f}")
+
+        print(f"  Loaded {len(df):,} rows | "
+              f"tunnel={int(df['gps_denied'].sum()):,} "
+              f"({100 * df['gps_denied'].mean():.1f}%)")
+        return df
+
+    def fit(self, df_train):
+        """Fit normalisation statistics on training data only."""
+        norm_feat_cols = [c for c in FEATURE_COLS if c != 'gps_denied']
+        self.feat_mean = df_train[norm_feat_cols].mean().values.astype(np.float32)
+        self.feat_std  = df_train[norm_feat_cols].std().values.astype(np.float32)
+        self.feat_std  = np.where(self.feat_std < 1e-6, 1.0, self.feat_std)
+
+        self.tgt_mean = df_train[TARGET_COLS].mean().values.astype(np.float32)
+        self.tgt_std  = df_train[TARGET_COLS].std().values.astype(np.float32)
+        self.tgt_std  = np.where(self.tgt_std < 1e-6, 1.0, self.tgt_std)
+
+        print(f"\n  Feature means : {dict(zip([c for c in FEATURE_COLS if c != 'gps_denied'], self.feat_mean.round(4)))}")
+        print(f"  Feature stds  : {dict(zip([c for c in FEATURE_COLS if c != 'gps_denied'], self.feat_std.round(4)))}")
+        print(f"  Target  means : {dict(zip(TARGET_COLS, self.tgt_mean.round(4)))}")
+        print(f"  Target  stds  : {dict(zip(TARGET_COLS, self.tgt_std.round(4)))}")
+
+    def transform_features(self, df):
+        """
+        Returns a new DataFrame with z-scored features.
+        gps_denied is left as 0/1. All other columns unchanged.
+        """
+        out = df.copy()
+        norm_feat_cols = [c for c in FEATURE_COLS if c != 'gps_denied']
+        out[norm_feat_cols] = (
+            df[norm_feat_cols].values.astype(np.float32) - self.feat_mean
+        ) / self.feat_std
+        return out
+
+    def normalise_targets(self, arr):
+        """arr: (N, 2) numpy array → z-scored array."""
+        return (arr - self.tgt_mean) / self.tgt_std
+
+    def denormalise_targets(self, arr):
+        """arr: (N, 2) numpy array → physical units (m/s²)."""
+        return arr * self.tgt_std + self.tgt_mean
+
+    def save(self, path):
+        np.savez(
+            path,
+            feat_mean    = self.feat_mean,
+            feat_std     = self.feat_std,
+            tgt_mean     = self.tgt_mean,
+            tgt_std      = self.tgt_std,
+            feature_cols = np.array(FEATURE_COLS),
+            target_cols  = np.array(TARGET_COLS),
+            seq_len      = np.array([SEQ_LEN]),
+            seed         = np.array([SEED]),
+        )
+        print(f"  Normalisation stats saved → {path}")
+
+
+# =============================================================================
+# DATASET
+# =============================================================================
+
+class IMUSequenceDataset(Dataset):
+    """
+    Sliding window dataset.
+
+    Each sample:
+      x : (SEQ_LEN, 5)  normalised feature sequence  [steps i … i+SEQ_LEN-1]
+      y : (2,)           normalised target at step i+SEQ_LEN  (next step)
+      w : scalar         sample weight (TUNNEL_WEIGHT if any step in tunnel)
+
+    Boundary exclusion (FIX 1):
+      A sequence at index i spans input rows [i, end-1] and target row [end].
+      The boundary check now verifies run_ids[i] == run_ids[end] (not end-1).
+      Previously, the last input step of Run N and the first row of Run N+1
+      could be paired as (input sequence, target), injecting a massive
+      false gradient spike once per run transition.
+
+    Targets are normalised here (not in main) so the Dataset is
+    self-contained and the normalisation path is unambiguous.
+    """
+
+    def __init__(self, df_norm, preprocessor, stride=1):
+        """
+        df_norm      : DataFrame with normalised features, raw targets,
+                       run_id, gps_denied columns.
+        preprocessor : DataPreprocessor (used to normalise targets).
+        stride       : step between consecutive sequence start indices.
+        """
+        features    = df_norm[FEATURE_COLS].values.astype(np.float32)
+        targets_raw = df_norm[TARGET_COLS].values.astype(np.float32)
+        targets     = preprocessor.normalise_targets(targets_raw).astype(np.float32)
+        run_ids     = df_norm['run_id'].values
+        gps_denied  = df_norm['gps_denied'].values.astype(np.float32)
+
+        seqs, tgts, wgts = [], [], []
+        n = len(features)
+
+        for i in range(0, n - SEQ_LEN, stride):
+            end = i + SEQ_LEN  # index of the TARGET step
+
+            # Guard: target index must be within bounds
+            if end >= n:
+                continue
+
+            # FIX 1: boundary check includes the TARGET step (run_ids[end]),
+            # not just the last input step (run_ids[end-1]).
+            # Without this fix, the target could come from the next run's
+            # first row (spawn-point, near-zero speed) while the input
+            # sequence is from the end of the previous run — a false label
+            # that caused one artificial gradient spike per run boundary.
+            if run_ids[i] != run_ids[end]:
+                continue
+
+            x = features[i:end]   # (SEQ_LEN, 5)
+            y = targets[end]       # (2,)
+            w = (TUNNEL_WEIGHT
+                 if gps_denied[i:end].any()
+                 else 1.0)
+
+            seqs.append(x)
+            tgts.append(y)
+            wgts.append(w)
+
+        self.X = np.array(seqs, dtype=np.float32)
+        self.Y = np.array(tgts, dtype=np.float32)
+        self.W = np.array(wgts, dtype=np.float32)
+
+        n_tun = (self.W > 1.0).sum()
+        print(f"    {len(self.X):,} sequences | "
+              f"tunnel: {n_tun:,} ({100 * n_tun / max(len(self.X), 1):.1f}%)")
+
+    def __len__(self):
         return len(self.X)
 
-    def __getitem__(self, idx: int):
-        return self.X[idx], self.y[idx]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#   MODEL
-# ══════════════════════════════════════════════════════════════════════════════
-
-class LSTMDriftCompensator(nn.Module):
-    """
-    Unidirectional 2-layer LSTM with a 3-layer MLP regression head.
-
-    Unidirectional by design: the output at the last timestep uses only
-    past and present data — no future lookahead — so the model can be called
-    every CARLA tick without imposing any latency on the KF correction.
-
-    Input  : (batch, SEQ_LEN, INPUT_SIZE)
-    Output : (batch, 2)   —  (Δx, Δy) in metres
-    """
-
-    def __init__(self,
-                 input_size:  int   = INPUT_SIZE,
-                 hidden_size: int   = HIDDEN_SIZE,
-                 num_layers:  int   = NUM_LAYERS,
-                 dropout:     float = DROPOUT) -> None:
-        super(LSTMDriftCompensator, self).__init__()
-
-        # Dropout only applies between stacked LSTM layers, not after the last
-        lstm_dropout = dropout if num_layers > 1 else 0.0
-
-        self.lstm = nn.LSTM(
-            input_size  = input_size,
-            hidden_size = hidden_size,
-            num_layers  = num_layers,
-            batch_first = True,
-            dropout     = lstm_dropout,
+    def __getitem__(self, idx):
+        return (
+            torch.from_numpy(self.X[idx]),
+            torch.from_numpy(self.Y[idx]),
+            torch.tensor(self.W[idx], dtype=torch.float32),
         )
+
+
+# =============================================================================
+# MODEL
+# =============================================================================
+
+class LSTMDriftPredictor(nn.Module):
+    """
+    Two-layer stacked LSTM with LayerNorm for IMU drift prediction.
+
+    LayerNorm (not BatchNorm) is used because:
+      - LayerNorm operates per-sample → stable for variable-length sequences.
+      - BatchNorm during inference with batch_size=1 (EKF bridge) collapses.
+
+    FIX 2 — LayerNorm / Dropout order:
+      Correct order is:  LSTM → LayerNorm → Dropout
+      Previous order was LSTM → Dropout → LayerNorm, which was wrong because:
+        1. Dropout randomly zeros activations and rescales the rest, causing
+           the layer's variance to swing on every forward pass.
+        2. LayerNorm placed after Dropout was normalising a randomly corrupted
+           distribution rather than the stable LSTM output — this made the
+           training loss curve jittery and slowed convergence.
+      Normalising the stable LSTM output first, then applying dropout, gives
+      LayerNorm a clean signal and makes the regularisation more principled.
+
+    Architecture:
+      InputLN → LSTM(5→64) → LN → Dropout
+             → LSTM(64→32) → LN → Dropout
+             → last step → Linear(32→16) → GELU → Linear(16→2)
+
+    ~31,000 parameters.
+    """
+
+    def __init__(self, input_size=5, h1=64, h2=32, dropout=0.3):
+        super().__init__()
+
+        # Normalise raw inputs before LSTM (stabilises early training)
+        self.input_ln = nn.LayerNorm(input_size)
+
+        self.lstm1 = nn.LSTM(input_size, h1, num_layers=1, batch_first=True)
+        self.ln1   = nn.LayerNorm(h1)     # FIX 2: LN before Dropout
+        self.drop1 = nn.Dropout(dropout)
+
+        self.lstm2 = nn.LSTM(h1, h2, num_layers=1, batch_first=True)
+        self.ln2   = nn.LayerNorm(h2)     # FIX 2: LN before Dropout
+        self.drop2 = nn.Dropout(dropout)
 
         self.head = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Linear(32, 2),   # no final activation — output is unbounded real
+            nn.Linear(h2, 16),
+            nn.GELU(),             # smoother than ReLU for regression
+            nn.Linear(16, len(TARGET_COLS)),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x           : (batch, seq_len, input_size)
-        lstm_out, _ = self.lstm(x)
-        last        = lstm_out[:, -1, :]   # (batch, hidden_size)
-        return self.head(last)             # (batch, 2)
+        self._init_weights()
+
+    def _init_weights(self):
+        """
+        Xavier for input-hidden weights, orthogonal for hidden-hidden.
+        Forget gate bias initialised to 1.0 (preserves long-term memory).
+        PyTorch LSTM bias layout: [input, forget, cell, output] × hidden_size.
+        Forget gate occupies slice [hidden_size : 2*hidden_size].
+        """
+        for name, p in self.named_parameters():
+            if 'weight_ih' in name:
+                nn.init.xavier_uniform_(p)
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(p)
+            elif 'bias' in name:
+                nn.init.zeros_(p)
+                n = p.size(0)
+                p.data[n // 4 : n // 2].fill_(1.0)  # forget gate bias = 1
+
+    def forward(self, x):
+        """
+        x   : (batch, SEQ_LEN, 5)
+        out : (batch, 2)
+        """
+        x = self.input_ln(x)
+
+        # Layer 1: LSTM → LayerNorm → Dropout  (FIX 2 order)
+        o1, _ = self.lstm1(x)    # (batch, seq, 64)
+        o1    = self.ln1(o1)
+        o1    = self.drop1(o1)
+
+        # Layer 2: LSTM → LayerNorm → Dropout  (FIX 2 order)
+        o2, _ = self.lstm2(o1)   # (batch, seq, 32)
+        o2    = self.ln2(o2)
+        o2    = self.drop2(o2)
+
+        last = o2[:, -1, :]      # (batch, 32) — last timestep only
+        return self.head(last)   # (batch, 2)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   DATA PIPELINE
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# LOSS
+# =============================================================================
 
-def load_csv(path: str) -> pd.DataFrame:
-    """Load the collected CSV, validate columns, drop NaN rows, report stats."""
-
-    if not os.path.isfile(path):
-        sys.exit(
-            f"\n[ERROR]  Data file not found:\n         {path}\n"
-            f"         Run data_collection/collect_data.py first.\n"
-        )
-
-    df = pd.read_csv(path)
-
-    missing = [c for c in RAW_COLS if c not in df.columns]
-    if missing:
-        sys.exit(
-            f"\n[ERROR]  Missing columns: {missing}\n"
-            f"         Found: {list(df.columns)}\n"
-        )
-
-    n_before = len(df)
-    df = df.dropna(subset=RAW_COLS).reset_index(drop=True)
-    dropped = n_before - len(df)
-    if dropped > 0:
-        print(f"[Data]   Dropped {dropped} rows with NaN values")
-
-    min_rows = SEQ_LEN * 20
-    if len(df) < min_rows:
-        sys.exit(
-            f"\n[ERROR]  Only {len(df)} rows — need at least {min_rows}.\n"
-            f"         Collect at least 10 minutes of data.\n"
-        )
-
-    n        = len(df)
-    n_denied = int(df['gps_denied'].sum())
-    duration = float(df['timestamp'].iloc[-1]) - float(df['timestamp'].iloc[0])
-
-    print(f"[Data]   Rows       : {n:,}")
-    print(f"[Data]   Duration   : {duration:.1f} s  ({duration / 60:.1f} min)")
-    print(f"[Data]   GPS denied : {n_denied:,}  ({100 * n_denied / n:.1f} %)")
-    print(f"[Data]   Speed      : "
-          f"{df['speed_mps'].min():.2f} – {df['speed_mps'].max():.2f} m/s")
-    print(f"[Data]   gt_x       : "
-          f"{df['gt_x'].min():.1f} – {df['gt_x'].max():.1f} m")
-    print(f"[Data]   gt_y       : "
-          f"{df['gt_y'].min():.1f} – {df['gt_y'].max():.1f} m")
-
-    return df
-
-
-def build_features(df: pd.DataFrame) -> pd.DataFrame:
+class WeightedMSELoss(nn.Module):
     """
-    Append all derived feature columns to the DataFrame.
-
-    sin_yaw / cos_yaw
-        Computed from atan2 of consecutive ground truth displacements.
-        This is the vehicle heading in the world frame.
-        sin/cos avoids the ±π wraparound discontinuity of raw yaw.
-
-    a_horiz
-        sqrt(ax² + ay²) — horizontal acceleration magnitude.
-        az is excluded because CARLA IMU leaves gravity in az (az ≈ 9.8 m/s²
-        always), so a_mag = sqrt(ax²+ay²+az²) ≈ 9.8 — nearly constant and
-        uninformative.  a_horiz captures lateral/longitudinal dynamics only.
-
-    gyro_mag
-        sqrt(wx²+wy²+wz²) — total rotation rate.
-        Rotation-invariant: distinguishes cornering from straight segments.
-
-    delta_spd
-        speed[t] − speed[t−1].  Longitudinal acceleration proxy.
-        First row is set to 0.0 (no predecessor available).
+    Sample-weighted MSE. Tunnel sequences get TUNNEL_WEIGHT × higher loss,
+    forcing the model to prioritise GPS-denied prediction accuracy.
     """
-    df = df.copy()
 
-    # Heading from consecutive ground truth positions
-    dx  = df['gt_x'].diff().fillna(0.0).values.astype(np.float32)
-    dy  = df['gt_y'].diff().fillna(0.0).values.astype(np.float32)
-    yaw = np.arctan2(dx, dy)
-    df['sin_yaw'] = np.sin(yaw).astype(np.float32)
-    df['cos_yaw'] = np.cos(yaw).astype(np.float32)
-
-    # Horizontal acceleration (gravity-free)
-    df['a_horiz'] = np.sqrt(
-        df['ax'].values ** 2 + df['ay'].values ** 2
-    ).astype(np.float32)
-
-    # Total rotation rate
-    df['gyro_mag'] = np.sqrt(
-        df['wx'].values ** 2 + df['wy'].values ** 2 + df['wz'].values ** 2
-    ).astype(np.float32)
-
-    # Longitudinal acceleration proxy
-    df['delta_spd'] = df['speed_mps'].diff().fillna(0.0).astype(np.float32)
-
-    # Guard: abort if any feature is NaN or Inf after computation
-    for col in FEATURE_COLS:
-        n_nan = int(df[col].isna().sum())
-        n_inf = int(np.isinf(df[col].values).sum())
-        if n_nan > 0 or n_inf > 0:
-            sys.exit(
-                f"\n[ERROR]  Feature '{col}' has {n_nan} NaN and "
-                f"{n_inf} Inf values after computation.\n"
-            )
-
-    return df
+    def forward(self, pred, target, weights):
+        # Per-sample MSE averaged over output dimensions → (batch,)
+        per_sample = ((pred - target) ** 2).mean(dim=1)
+        return (per_sample * weights).mean()
 
 
-def build_windows(df: pd.DataFrame):
+# =============================================================================
+# TRAINING FUNCTIONS
+# =============================================================================
+
+def run_epoch(model, loader, criterion, device,
+              optimizer=None, grad_clip=None):
     """
-    Sliding-window extraction over the full sequence.
-
-    For window i starting at row index t:
-        X[i] = FEATURE_COLS values at rows  [t, t+SEQ_LEN)
-        y[i] = gt_pos[t+SEQ_LEN] − gt_pos[t]
-
-    Returns
-    -------
-    X : float32 ndarray  (N, SEQ_LEN, INPUT_SIZE)
-    y : float32 ndarray  (N, 2)
+    One full pass over `loader`.
+    If optimizer is provided: training mode (backprop + weight update).
+    Otherwise: evaluation mode (no grad).
+    Returns (mean_weighted_mse_loss, mean_grad_norm).
+    grad_norm is 0.0 for eval passes.
     """
-    features = df[FEATURE_COLS].values.astype(np.float32)
-    gt_x     = df['gt_x'].values.astype(np.float32)
-    gt_y     = df['gt_y'].values.astype(np.float32)
-    n_rows   = len(df)
+    training = optimizer is not None
+    model.train(training)
+    total_loss  = 0.0
+    total_gnorm = 0.0
+    n_batches   = 0
 
-    n_max = (n_rows - SEQ_LEN) // STRIDE
-    X = np.empty((n_max, SEQ_LEN, INPUT_SIZE), dtype=np.float32)
-    y = np.empty((n_max, 2),                   dtype=np.float32)
+    ctx = torch.enable_grad() if training else torch.no_grad()
 
-    count = 0
-    for t in range(0, n_rows - SEQ_LEN, STRIDE):
-        end         = t + SEQ_LEN
-        X[count]    = features[t:end]
-        y[count, 0] = gt_x[end] - gt_x[t]
-        y[count, 1] = gt_y[end] - gt_y[t]
-        count      += 1
+    with ctx:
+        for x, y, w in loader:
+            x, y, w = x.to(device), y.to(device), w.to(device)
 
-    X = X[:count]
-    y = y[:count]
+            if training:
+                optimizer.zero_grad()
 
-    print(f"[Windows] Count   : {count:,}  "
-          f"(seq={SEQ_LEN}×0.05={SEQ_LEN*0.05:.2f}s  "
-          f"stride={STRIDE}×0.05={STRIDE*0.05:.2f}s  "
-          f"{100*(1-STRIDE/SEQ_LEN):.0f}% overlap)")
-    print(f"[Windows] Δx range: {y[:,0].min():.2f} – {y[:,0].max():.2f} m")
-    print(f"[Windows] Δy range: {y[:,1].min():.2f} – {y[:,1].max():.2f} m")
+            pred = model(x)
+            loss = criterion(pred, y, w)
 
-    return X, y
+            if training:
+                loss.backward()
+                gnorm = nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+                total_gnorm += gnorm.item()
+
+            total_loss += loss.item() * len(x)
+            n_batches  += 1
+
+    mean_loss  = total_loss / len(loader.dataset)
+    mean_gnorm = total_gnorm / max(n_batches, 1)
+    return mean_loss, mean_gnorm
 
 
-def time_split(X: np.ndarray, y: np.ndarray):
+# =============================================================================
+# EVALUATION
+# =============================================================================
+
+def evaluate(model, loader, preprocessor, device):
     """
-    Chronological split.  No shuffling across boundaries — that would leak
-    future motion patterns into the training set and inflate validation metrics.
-
-    Layout:  [─── train (75%) ───][── val (15%) ──][─ test (10%) ─]
-                                  oldest ──────────────────► newest
-
-    Returns  X_train, y_train, X_val, y_val, X_test, y_test
-    """
-    n       = len(X)
-    n_test  = max(1, int(n * TEST_FRAC))
-    n_val   = max(1, int(n * VAL_FRAC))
-    n_train = n - n_val - n_test
-
-    if n_train < 200:
-        sys.exit(
-            f"\n[ERROR]  Only {n_train} training windows after split.\n"
-            f"         Collect more data or reduce VAL_FRAC / TEST_FRAC.\n"
-        )
-
-    return (
-        X[:n_train],              y[:n_train],
-        X[n_train:n_train+n_val], y[n_train:n_train+n_val],
-        X[n_train+n_val:],        y[n_train+n_val:],
-    )
-
-
-def fit_normaliser(X_train: np.ndarray):
-    """
-    Compute per-feature mean and std from training windows ONLY.
-    Applying training statistics to val and test prevents those splits from
-    influencing the normalisation.
-
-    Returns mean, std — both float32 ndarray  shape (INPUT_SIZE,)
-    """
-    _, _, n_feat = X_train.shape
-    flat = X_train.reshape(-1, n_feat)
-    mean = flat.mean(axis=0).astype(np.float32)
-    std  = flat.std(axis=0).astype(np.float32)
-    std  = np.where(std < 1e-8, 1.0, std)   # guard constant/near-constant features
-    return mean, std
-
-
-def apply_normaliser(X:    np.ndarray,
-                     mean: np.ndarray,
-                     std:  np.ndarray) -> np.ndarray:
-    n, seq, n_feat = X.shape
-    flat = X.reshape(-1, n_feat)
-    return ((flat - mean) / std).reshape(n, seq, n_feat).astype(np.float32)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#   TRAINING / EVALUATION
-# ══════════════════════════════════════════════════════════════════════════════
-
-def train_one_epoch(model:     nn.Module,
-                    loader:    DataLoader,
-                    optimiser: torch.optim.Optimizer,
-                    criterion: nn.Module,
-                    device:    torch.device) -> float:
-    """One full pass over the training set.  Returns mean loss."""
-    model.train()
-    total_loss, total_n = 0.0, 0
-
-    for X_b, y_b in loader:
-        X_b = X_b.to(device)
-        y_b = y_b.to(device)
-
-        optimiser.zero_grad()
-        loss = criterion(model(X_b), y_b)
-        loss.backward()
-
-        # Gradient clipping prevents the well-known LSTM exploding-gradient issue
-        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-        optimiser.step()
-        total_loss += loss.item() * len(X_b)
-        total_n    += len(X_b)
-
-    return total_loss / total_n
-
-
-@torch.no_grad()
-def evaluate(model:     nn.Module,
-             loader:    DataLoader,
-             criterion: nn.Module,
-             device:    torch.device):
-    """
-    Full evaluation pass.
-
-    Returns
-    -------
-    avg_loss : float            mean Huber loss
-    rmse_2d  : float            mean Euclidean displacement error (metres)
-    preds    : (N, 2) ndarray
-    trues    : (N, 2) ndarray
+    Returns:
+      metrics : dict — MAE, RMSE, R² per target × {all, tunnel}
+      pred_p  : (N, 2) predictions in physical units (m/s²)
+      true_p  : (N, 2) ground truth in physical units (m/s²)
+      is_tun  : (N,) bool — True for tunnel sequences
     """
     model.eval()
-    total_loss, total_n = 0.0, 0
-    preds_list, trues_list = [], []
+    all_pred, all_true, all_tun = [], [], []
 
-    for X_b, y_b in loader:
-        X_b  = X_b.to(device)
-        y_b  = y_b.to(device)
-        pred = model(X_b)
+    with torch.no_grad():
+        for x, y, w in loader:
+            pred = model(x.to(device)).cpu().numpy()
+            all_pred.append(pred)
+            all_true.append(y.numpy())
+            all_tun.append(w.numpy() > 1.0)
 
-        total_loss += criterion(pred, y_b).item() * len(X_b)
-        total_n    += len(X_b)
-        preds_list.append(pred.cpu().numpy())
-        trues_list.append(y_b.cpu().numpy())
+    pred_n = np.vstack(all_pred)
+    true_n = np.vstack(all_true)
+    is_tun = np.concatenate(all_tun)
 
-    preds   = np.concatenate(preds_list, axis=0)
-    trues   = np.concatenate(trues_list, axis=0)
-    rmse_2d = float(np.sqrt(((preds - trues) ** 2).sum(axis=1)).mean())
+    pred_p = preprocessor.denormalise_targets(pred_n)
+    true_p = preprocessor.denormalise_targets(true_n)
 
-    return total_loss / total_n, rmse_2d, preds, trues
+    def _metrics(p, t, label):
+        mae  = np.mean(np.abs(p - t))
+        rmse = np.sqrt(np.mean((p - t) ** 2))
+        r2   = 1 - np.sum((p - t) ** 2) / (np.sum((t - t.mean()) ** 2) + 1e-8)
+        return {
+            f'{label}_MAE':  mae,
+            f'{label}_RMSE': rmse,
+            f'{label}_R2':   r2,
+        }
 
+    metrics = {}
+    for i, col in enumerate(TARGET_COLS):
+        tag = col.replace('gt_accel_', '').replace('_mps2', '')
+        metrics.update(_metrics(pred_p[:, i], true_p[:, i], f'{tag}_all'))
+        if is_tun.sum() > 0:
+            metrics.update(
+                _metrics(pred_p[is_tun, i], true_p[is_tun, i], f'{tag}_tunnel')
+            )
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   PLOTS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def plot_training_curves(train_losses: list,
-                         val_losses:   list,
-                         val_rmses:    list,
-                         path:         str) -> None:
-
-    epochs = list(range(1, len(train_losses) + 1))
-    best   = min(val_rmses)
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
-
-    ax1.plot(epochs, train_losses, label='Train', linewidth=1.5)
-    ax1.plot(epochs, val_losses,   label='Val',   linewidth=1.5)
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Huber Loss')
-    ax1.set_title('Loss curves  (log scale)')
-    ax1.set_yscale('log')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2.plot(epochs, val_rmses, color='green', linewidth=1.5)
-    ax2.axhline(best, color='red', linestyle='--', linewidth=1,
-                label=f'Best  {best:.4f} m')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('RMSE (m)')
-    ax2.set_title('Validation 2D RMSE')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    plt.suptitle('LSTM Drift Compensator — Training', fontsize=13)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"[Plot]   Saved: {path}")
+    return metrics, pred_p, true_p, is_tun
 
 
-def plot_test_predictions(preds: np.ndarray,
-                          trues: np.ndarray,
-                          path:  str) -> None:
-    """4-panel: time-series and scatter for Δx and Δy on the test split."""
+# =============================================================================
+# VISUALISATION
+# =============================================================================
 
-    n_show = min(500, len(preds))
-    idx    = np.arange(n_show)
-    rmse_x = float(np.sqrt(np.mean((preds[:, 0] - trues[:, 0]) ** 2)))
-    rmse_y = float(np.sqrt(np.mean((preds[:, 1] - trues[:, 1]) ** 2)))
+def plot_results(train_losses, val_losses, pred_p, true_p, is_tun, save_path):
+    """
+    5-panel results figure:
+      [0,0] Train/val loss curves (log scale)
+      [0,1] Fwd accel scatter  (subsampled to 2000 pts)
+      [1,0] Fwd accel time series (first 500 steps = 25s)
+      [1,1] Lat accel scatter
+      [2,0] Tunnel vs open-road error distribution
+    """
+    fig = plt.figure(figsize=(15, 11))
+    fig.suptitle("LSTM Drift Predictor — Training Results  (v3)",
+                 fontsize=13, fontweight='bold')
+    gs = gridspec.GridSpec(3, 2, hspace=0.45, wspace=0.35)
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    ax_loss = fig.add_subplot(gs[0, 0])
+    ax_fwd  = fig.add_subplot(gs[0, 1])
+    ax_ts   = fig.add_subplot(gs[1, 0])
+    ax_lat  = fig.add_subplot(gs[1, 1])
+    ax_err  = fig.add_subplot(gs[2, 0])
 
-    # ── time series ─────────────────────────────────────────────────────
-    for col, label, ax in [(0, 'Δx', axes[0, 0]), (1, 'Δy', axes[0, 1])]:
-        ax.plot(idx, trues[:n_show, col],
-                label=f'True {label}', alpha=0.8, linewidth=0.9)
-        ax.plot(idx, preds[:n_show, col],
-                label=f'Pred {label}', alpha=0.8, linewidth=0.9)
-        ax.set_title(f'Displacement {label} — test set (first {n_show})')
-        ax.set_xlabel('Window index')
-        ax.set_ylabel('metres')
-        ax.legend()
-        ax.grid(True, alpha=0.3)
+    # ── Loss curves ──────────────────────────────────────────────────────────
+    ep = range(1, len(train_losses) + 1)
+    ax_loss.plot(ep, train_losses, 'b-', lw=1.5, label='Train')
+    ax_loss.plot(ep, val_losses,   'r-', lw=1.5, label='Val')
+    ax_loss.set_yscale('log')
+    ax_loss.set_title("Weighted MSE Loss (log scale)")
+    ax_loss.set_xlabel("Epoch")
+    ax_loss.set_ylabel("Loss")
+    ax_loss.legend()
+    ax_loss.grid(True, alpha=0.3)
 
-    # ── scatter ──────────────────────────────────────────────────────────
-    for col, rmse, color, ax in [
-        (0, rmse_x, 'steelblue',  axes[1, 0]),
-        (1, rmse_y, 'darkorange', axes[1, 1]),
-    ]:
-        label = 'Δx' if col == 0 else 'Δy'
-        vals  = np.concatenate([trues[:, col], preds[:, col]])
-        lim   = float(np.abs(vals).max()) * 1.1
-        ax.scatter(trues[:, col], preds[:, col],
-                   alpha=0.25, s=4, color=color)
-        ax.plot([-lim, lim], [-lim, lim], 'r--',
-                linewidth=1, label='Perfect')
-        ax.set_title(f'{label}  True vs Predicted   RMSE = {rmse:.4f} m')
-        ax.set_xlabel(f'True {label} (m)')
-        ax.set_ylabel(f'Predicted {label} (m)')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
+    # ── Subsampled scatter: forward accel ─────────────────────────────────────
+    idx      = np.random.choice(len(true_p), size=min(2000, len(true_p)), replace=False)
+    tun_idx  = idx[is_tun[idx]]
+    road_idx = idx[~is_tun[idx]]
+    lim      = max(abs(true_p[idx, 0]).max(), abs(pred_p[idx, 0]).max()) * 1.05
 
-    plt.suptitle('LSTM Drift Compensator — Test Predictions', fontsize=13)
-    plt.tight_layout()
-    plt.savefig(path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"[Plot]   Saved: {path}")
+    ax_fwd.scatter(true_p[road_idx, 0], pred_p[road_idx, 0],
+                   alpha=0.3, s=2, c='steelblue', label='Open road')
+    ax_fwd.scatter(true_p[tun_idx,  0], pred_p[tun_idx,  0],
+                   alpha=0.5, s=4, c='tomato',    label='Tunnel')
+    ax_fwd.plot([-lim, lim], [-lim, lim], 'k--', lw=1, label='Perfect')
+    ax_fwd.set_title("Forward Accel: Pred vs True")
+    ax_fwd.set_xlabel("True (m/s²)")
+    ax_fwd.set_ylabel("Pred (m/s²)")
+    ax_fwd.legend(fontsize=7)
+    ax_fwd.grid(True, alpha=0.3)
+    ax_fwd.set_xlim(-lim, lim)
+    ax_fwd.set_ylim(-lim, lim)
+
+    # ── Time series ───────────────────────────────────────────────────────────
+    n  = min(500, len(true_p))
+    ts = np.arange(n) * 0.05
+    ax_ts.plot(ts, true_p[:n, 0], 'g-',  lw=1, label='True')
+    ax_ts.plot(ts, pred_p[:n, 0], 'b--', lw=1, label='LSTM')
+    tun_mask = is_tun[:n]
+    if tun_mask.any():
+        ylims = ax_ts.get_ylim()
+        ax_ts.fill_between(ts, ylims[0], ylims[1],
+                           where=tun_mask, alpha=0.15, color='red',
+                           label='Tunnel zone')
+    ax_ts.set_title("Forward Accel Time Series (first 25s)")
+    ax_ts.set_xlabel("Time (s)")
+    ax_ts.set_ylabel("Accel (m/s²)")
+    ax_ts.legend(fontsize=7)
+    ax_ts.grid(True, alpha=0.3)
+
+    # ── Lateral accel scatter ─────────────────────────────────────────────────
+    lim2 = max(abs(true_p[idx, 1]).max(), abs(pred_p[idx, 1]).max()) * 1.05
+    ax_lat.scatter(true_p[road_idx, 1], pred_p[road_idx, 1],
+                   alpha=0.3, s=2, c='steelblue', label='Open road')
+    ax_lat.scatter(true_p[tun_idx,  1], pred_p[tun_idx,  1],
+                   alpha=0.5, s=4, c='tomato',    label='Tunnel')
+    ax_lat.plot([-lim2, lim2], [-lim2, lim2], 'k--', lw=1)
+    ax_lat.set_title("Lateral Accel: Pred vs True")
+    ax_lat.set_xlabel("True (m/s²)")
+    ax_lat.set_ylabel("Pred (m/s²)")
+    ax_lat.legend(fontsize=7)
+    ax_lat.grid(True, alpha=0.3)
+    ax_lat.set_xlim(-lim2, lim2)
+    ax_lat.set_ylim(-lim2, lim2)
+
+    # ── Error distribution: tunnel vs open road ───────────────────────────────
+    err_fwd = np.abs(pred_p[:, 0] - true_p[:, 0])
+    bins    = np.linspace(0, np.percentile(err_fwd, 95), 40)
+    if is_tun.sum() > 0:
+        ax_err.hist(err_fwd[~is_tun], bins=bins, alpha=0.6,
+                    color='steelblue',
+                    label=f'Open road (n={int((~is_tun).sum())})',
+                    density=True)
+        ax_err.hist(err_fwd[is_tun],  bins=bins, alpha=0.6,
+                    color='tomato',
+                    label=f'Tunnel (n={int(is_tun.sum())})',
+                    density=True)
+    ax_err.set_title("Forward Accel Absolute Error Distribution")
+    ax_err.set_xlabel("|Pred - True|  (m/s²)")
+    ax_err.set_ylabel("Density")
+    ax_err.legend(fontsize=7)
+    ax_err.grid(True, alpha=0.3)
+
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+    print(f"  Plot saved → {save_path}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#   MAIN
-# ══════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# MAIN
+# =============================================================================
 
-def main() -> None:
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    os.makedirs(PLOT_DIR,  exist_ok=True)
+def main():
+    os.makedirs(MODEL_DIR,   exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    print('=' * 68)
-    print('  LSTM DRIFT COMPENSATOR — Training  (v2)')
-    print('=' * 68)
-    print(f'  Device     : {device}')
-    print(f'  Data       : {DATA_CSV}')
-    print(f'  Features   : {INPUT_SIZE}  →  {FEATURE_COLS}')
-    print(f'  Window     : {SEQ_LEN} steps = {SEQ_LEN * 0.05:.2f} s')
-    print(f'  Stride     : {STRIDE} steps = {STRIDE * 0.05:.2f} s  '
-          f'({100*(1 - STRIDE/SEQ_LEN):.0f}% overlap)')
-    print(f'  Loss       : SmoothL1Loss (Huber)')
-    print(f'  LSTM       : unidirectional  hidden={HIDDEN_SIZE}  layers={NUM_LAYERS}')
-    print('=' * 68 + '\n')
+    print(f"\n{'='*62}")
+    print(f"  LSTM Drift Predictor  —  v3 Final")
+    print(f"  Device  : {device}")
+    print(f"  Seed    : {SEED}")
+    print(f"  SEQ_LEN : {SEQ_LEN} steps ({SEQ_LEN * 0.05:.1f}s context)")
+    print(f"  Features: {FEATURE_COLS}")
+    print(f"  Targets : {TARGET_COLS}")
+    print(f"{'='*62}\n")
 
-    # ── 1. Load ───────────────────────────────────────────────────────────
-    print('[1/7]  Loading data ...')
-    df = load_csv(DATA_CSV)
+    # ── Load & clean ──────────────────────────────────────────────────────────
+    print("Loading data...")
+    prep = DataPreprocessor()
+    df   = prep.load_and_clean(DATA_PATH)
 
-    # ── 2. Derived features ───────────────────────────────────────────────
-    print('\n[2/7]  Computing derived features ...')
-    df = build_features(df)
-    for col in ['sin_yaw', 'cos_yaw', 'a_horiz', 'gyro_mag', 'delta_spd']:
-        print(f'       {col:12s}  [{df[col].min():+.4f}, {df[col].max():+.4f}]')
+    # ── Split by run (no leakage) ─────────────────────────────────────────────
+    df_train    = df[df['run_id'].isin(TRAIN_RUNS)].reset_index(drop=True)
+    df_val_full = df[df['run_id'].isin(VAL_RUNS)].reset_index(drop=True)
+    mid         = len(df_val_full) // 2
+    df_val      = df_val_full.iloc[:mid].reset_index(drop=True)
+    df_test     = df_val_full.iloc[mid:].reset_index(drop=True)
 
-    # ── 3. Windows ────────────────────────────────────────────────────────
-    print('\n[3/7]  Building sliding windows ...')
-    X, y = build_windows(df)
+    print(f"\nData split:")
+    print(f"  Train : {len(df_train):,} rows  runs={TRAIN_RUNS}")
+    print(f"  Val   : {len(df_val):,} rows  run {VAL_RUNS} first half")
+    print(f"  Test  : {len(df_test):,} rows  run {VAL_RUNS} second half")
 
-    # ── 4. Split ──────────────────────────────────────────────────────────
-    print('\n[4/7]  Splitting (time-ordered) ...')
-    X_train, y_train, X_val, y_val, X_test, y_test = time_split(X, y)
-    print(f'       Train={len(X_train):,}  Val={len(X_val):,}  Test={len(X_test):,}')
+    # ── Fit normalisation on training data only ───────────────────────────────
+    print("\nFitting normalisation...")
+    prep.fit(df_train)
+    prep.save(STATS_PATH)
 
-    # ── 5. Normalise ──────────────────────────────────────────────────────
-    print('\n[5/7]  Fitting normaliser on training set only ...')
-    norm_mean, norm_std = fit_normaliser(X_train)
+    df_train_n = prep.transform_features(df_train)
+    df_val_n   = prep.transform_features(df_val)
+    df_test_n  = prep.transform_features(df_test)
 
-    X_train_n = apply_normaliser(X_train, norm_mean, norm_std)
-    X_val_n   = apply_normaliser(X_val,   norm_mean, norm_std)
-    X_test_n  = apply_normaliser(X_test,  norm_mean, norm_std)
+    # ── Datasets ──────────────────────────────────────────────────────────────
+    print("\nBuilding datasets (targets normalised inside Dataset)...")
+    print("  Train:")
+    train_ds = IMUSequenceDataset(df_train_n, prep, stride=STRIDE)
+    print("  Val:")
+    val_ds   = IMUSequenceDataset(df_val_n,   prep, stride=1)
+    print("  Test:")
+    test_ds  = IMUSequenceDataset(df_test_n,  prep, stride=1)
 
-    chk = X_train_n.reshape(-1, INPUT_SIZE)
-    print(f'       Post-norm  mean={chk.mean():.5f}  std={chk.std():.5f}'
-          f'  (should be ≈ 0.0, ≈ 1.0)')
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
+                              shuffle=True,  num_workers=0)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE,
+                              shuffle=False, num_workers=0)
+    test_loader  = DataLoader(test_ds,  batch_size=BATCH_SIZE,
+                              shuffle=False, num_workers=0)
 
-    norm_path = os.path.join(MODEL_DIR, 'lstm_norm_params.npz')
-    np.savez(norm_path,
-             mean         = norm_mean,
-             std          = norm_std,
-             feature_cols = np.array(FEATURE_COLS))
-    print(f'       Saved  : {norm_path}')
-
-    # ── 6. Model + training setup ─────────────────────────────────────────
-    print('\n[6/7]  Building model ...')
-    train_loader = DataLoader(
-        DisplacementDataset(X_train_n, y_train),
-        batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=0, pin_memory=(device.type == 'cuda'),
-    )
-    val_loader = DataLoader(
-        DisplacementDataset(X_val_n, y_val),
-        batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=0, pin_memory=(device.type == 'cuda'),
-    )
-    test_loader = DataLoader(
-        DisplacementDataset(X_test_n, y_test),
-        batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=0, pin_memory=(device.type == 'cuda'),
-    )
-
-    model = LSTMDriftCompensator(
-        input_size=INPUT_SIZE, hidden_size=HIDDEN_SIZE,
-        num_layers=NUM_LAYERS, dropout=DROPOUT,
+    # ── Model ─────────────────────────────────────────────────────────────────
+    model = LSTMDriftPredictor(
+        input_size=len(FEATURE_COLS),
+        h1=HIDDEN1, h2=HIDDEN2, dropout=DROPOUT,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'       Trainable parameters : {n_params:,}')
+    print(f"\nModel: {n_params:,} parameters")
+    print(f"  LSTM(5→{HIDDEN1}) → LSTM({HIDDEN1}→{HIDDEN2}) → "
+          f"Linear({HIDDEN2}→16) → Linear(16→2)")
 
-    # SmoothL1Loss = Huber: quadratic for |e| < 1, linear beyond — robust to outliers
-    criterion = nn.SmoothL1Loss()
-    optimiser = torch.optim.Adam(model.parameters(), lr=LR_INIT)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimiser, mode='min', factor=LR_FACTOR,
-        patience=LR_PATIENCE, min_lr=LR_MIN,
+    # ── Optimiser & scheduler ─────────────────────────────────────────────────
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
     )
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min',
+        factor=LR_FACTOR, patience=LR_PATIENCE,
+        min_lr=LR_MIN,
+    )
+    criterion = WeightedMSELoss()
 
-    # ── 7. Training loop ──────────────────────────────────────────────────
-    print('\n[7/7]  Training ...\n')
-    hdr = (f"  {'Epoch':>5}  {'Train':>11}  {'Val':>11}  "
-           f"{'Val RMSE':>10}  {'LR':>10}  Note")
-    print(hdr)
-    print('  ' + '─' * (len(hdr) - 2))
+    # ── Training loop ─────────────────────────────────────────────────────────
+    print(f"\nTraining (max {NUM_EPOCHS} epochs, "
+          f"early-stop patience={PATIENCE})...\n")
+    print(f"  {'Ep':>4}  {'Train':>10}  {'Val':>10}  "
+          f"{'Best':>10}  {'GNorm':>7}  {'LR':>8}  {'NoImprove':>9}")
+    print("  " + "-" * 70)
 
-    model_path = os.path.join(MODEL_DIR, 'lstm_drift.pt')
-    log_path   = os.path.join(MODEL_DIR, 'lstm_training_log.csv')
+    train_losses, val_losses = [], []
+    best_val   = float('inf')
+    no_improve = 0
+    best_epoch = 0
 
-    train_losses, val_losses, val_rmses, log_rows = [], [], [], []
-    best_val_loss = float('inf')
-    best_epoch    = 1
-    es_counter    = 0
-    t0            = time.time()
+    for epoch in range(1, NUM_EPOCHS + 1):
 
-    for epoch in range(1, EPOCHS + 1):
-        t_loss              = train_one_epoch(
-            model, train_loader, optimiser, criterion, device)
-        v_loss, v_rmse, _, _ = evaluate(
-            model, val_loader, criterion, device)
+        tr_loss, gnorm = run_epoch(
+            model, train_loader, criterion, device,
+            optimizer=optimizer, grad_clip=GRAD_CLIP,
+        )
+        vl_loss, _ = run_epoch(
+            model, val_loader, criterion, device,
+        )
 
-        scheduler.step(v_loss)
-        lr = float(optimiser.param_groups[0]['lr'])
+        train_losses.append(tr_loss)
+        val_losses.append(vl_loss)
+        scheduler.step(vl_loss)
 
-        train_losses.append(float(t_loss))
-        val_losses.append(float(v_loss))
-        val_rmses.append(float(v_rmse))
-        log_rows.append({'epoch': epoch,
-                         'train_loss': round(t_loss, 8),
-                         'val_loss':   round(v_loss, 8),
-                         'val_rmse_m': round(v_rmse, 6),
-                         'lr':         round(lr,     8)})
-
-        is_best = v_loss < best_val_loss
-        if is_best:
-            best_val_loss = v_loss
-            best_epoch    = epoch
-            es_counter    = 0
+        if vl_loss < best_val:
+            best_val   = vl_loss
+            best_epoch = epoch
+            no_improve = 0
             torch.save({
-                'epoch'      : epoch,
+                'epoch':       epoch,
                 'model_state': model.state_dict(),
-                'val_loss'   : float(v_loss),
-                'val_rmse'   : float(v_rmse),
-                'hparams'    : {
-                    'input_size'   : INPUT_SIZE,
-                    'hidden_size'  : HIDDEN_SIZE,
-                    'num_layers'   : NUM_LAYERS,
-                    'dropout'      : DROPOUT,
-                    'seq_len'      : SEQ_LEN,
-                    'feature_cols' : FEATURE_COLS,
+                'optim_state': optimizer.state_dict(),
+                'val_loss':    best_val,
+                'config': {
+                    'input_size':   len(FEATURE_COLS),
+                    'h1':           HIDDEN1,
+                    'h2':           HIDDEN2,
+                    'dropout':      DROPOUT,
+                    'seq_len':      SEQ_LEN,
+                    'feature_cols': FEATURE_COLS,
+                    'target_cols':  TARGET_COLS,
+                    'seed':         SEED,
                 },
-            }, model_path)
+            }, MODEL_PATH)
         else:
-            es_counter += 1
+            no_improve += 1
 
-        note = '← BEST' if is_best else ''
-        if epoch % 5 == 0 or epoch == 1 or is_best:
-            print(f"  {epoch:>5}  {t_loss:>11.6f}  {v_loss:>11.6f}  "
-                  f"{v_rmse:>9.4f} m  {lr:>10.2e}  {note}")
+        lr_now = optimizer.param_groups[0]['lr']
+        print(f"  {epoch:>4}  {tr_loss:>10.6f}  {vl_loss:>10.6f}  "
+              f"{best_val:>10.6f}  {gnorm:>7.3f}  {lr_now:>8.2e}  "
+              f"{no_improve:>4}/{PATIENCE}")
 
-        if es_counter >= ES_PATIENCE:
-            print(f"\n  [Early Stop]  No improvement for {ES_PATIENCE} epochs "
-                  f"— stopped at epoch {epoch}.")
+        if no_improve >= PATIENCE:
+            print(f"\n  Early stopping at epoch {epoch}.")
             break
 
-    # ── Save log ──────────────────────────────────────────────────────────
-    with open(log_path, 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=list(log_rows[0].keys()))
-        w.writeheader()
-        w.writerows(log_rows)
+    print(f"\n  Best val loss : {best_val:.6f}  (epoch {best_epoch})")
 
-    # ── Test evaluation ───────────────────────────────────────────────────
-    print(f'\n  Loading best checkpoint (epoch {best_epoch}) ...')
-    ckpt = torch.load(model_path, map_location=device)
+    # ── Load best checkpoint ──────────────────────────────────────────────────
+    ckpt = torch.load(MODEL_PATH, map_location=device)
     model.load_state_dict(ckpt['model_state'])
+    print(f"  Loaded best model from epoch {ckpt['epoch']}")
 
-    _, test_rmse, test_preds, test_trues = evaluate(
-        model, test_loader, criterion, device)
+    # ── Test evaluation ───────────────────────────────────────────────────────
+    print(f"\n{'='*62}")
+    print("  TEST SET EVALUATION")
+    print(f"{'='*62}")
 
-    rmse_x = float(np.sqrt(np.mean((test_preds[:, 0] - test_trues[:, 0]) ** 2)))
-    rmse_y = float(np.sqrt(np.mean((test_preds[:, 1] - test_trues[:, 1]) ** 2)))
-    mae_x  = float(np.mean(np.abs(test_preds[:, 0] - test_trues[:, 0])))
-    mae_y  = float(np.mean(np.abs(test_preds[:, 1] - test_trues[:, 1])))
+    metrics, pred_p, true_p, is_tun = evaluate(
+        model, test_loader, prep, device,
+    )
 
-    print(f'\n{"=" * 68}')
-    print(f'  TEST RESULTS   (best model: epoch {best_epoch})')
-    print(f'{"=" * 68}')
-    print(f'  2D RMSE       : {test_rmse:.4f} m')
-    print(f'  RMSE  Δx      : {rmse_x:.4f} m')
-    print(f'  RMSE  Δy      : {rmse_y:.4f} m')
-    print(f'  MAE   Δx      : {mae_x:.4f} m')
-    print(f'  MAE   Δy      : {mae_y:.4f} m')
-    print(f'  Training time : {time.time() - t0:.0f} s')
-    print(f'{"=" * 68}')
-    print(f'  Saved:')
-    print(f'    {model_path}')
-    print(f'    {norm_path}')
-    print(f'    {log_path}')
+    lines = [
+        "LSTM Drift Predictor v3 — Test Metrics",
+        "=" * 62,
+        f"Seed: {SEED}  |  Best epoch: {best_epoch}  |  Val loss: {best_val:.6f}",
+        "",
+        f"{'Metric':<35} {'Value':>10}",
+        "-" * 47,
+    ]
+    for k, v in metrics.items():
+        unit = "(m/s²)" if ("MAE" in k or "RMSE" in k) else ""
+        line = f"  {k:<33} {v:>10.4f}  {unit}"
+        print(line)
+        lines.append(line)
 
-    # ── Plots ─────────────────────────────────────────────────────────────
-    plot_training_curves(
-        train_losses, val_losses, val_rmses,
-        os.path.join(PLOT_DIR, 'lstm_training_curves.png'))
-    plot_test_predictions(
-        test_preds, test_trues,
-        os.path.join(PLOT_DIR, 'lstm_test_predictions.png'))
+    print(f"\n  Tunnel sequences in test : {is_tun.sum():,} / {len(is_tun):,} "
+          f"({100 * is_tun.mean():.1f}%)")
 
-    print('\n  DONE.  Next step → kalman_filter.py  then  fusion.py')
+    with open(METRICS_PATH, 'w') as f:
+        f.write("\n".join(lines))
+    print(f"\n  Metrics saved → {METRICS_PATH}")
+
+    # ── Plot ──────────────────────────────────────────────────────────────────
+    print("\nGenerating plots...")
+    plot_results(train_losses, val_losses, pred_p, true_p, is_tun, PLOT_PATH)
+
+    print(f"\n{'='*62}")
+    print("  DONE")
+    print(f"  Model   → {MODEL_PATH}")
+    print(f"  Stats   → {STATS_PATH}")
+    print(f"  Metrics → {METRICS_PATH}")
+    print(f"  Plot    → {PLOT_PATH}")
+    print(f"\n  Expected results:")
+    print(f"    fwd_all_R2    > 0.85   (open road + tunnel)")
+    print(f"    fwd_tunnel_R2 > 0.75   (GPS denied — harder)")
+    print(f"    fwd_all_MAE   < 0.5 m/s²")
+    print(f"\n  Next: python lstm_ekf_bridge.py")
+    print(f"{'='*62}\n")
 
 
 if __name__ == '__main__':

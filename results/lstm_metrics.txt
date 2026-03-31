@@ -1,0 +1,18 @@
+LSTM Drift Predictor v3 — Test Metrics
+==============================================================
+Seed: 42  |  Best epoch: 35  |  Val loss: 0.175382
+
+Metric                                   Value
+-----------------------------------------------
+  fwd_all_MAE                           0.6814  (m/s²)
+  fwd_all_RMSE                          1.3754  (m/s²)
+  fwd_all_R2                            0.8355  
+  fwd_tunnel_MAE                        1.0891  (m/s²)
+  fwd_tunnel_RMSE                       2.0975  (m/s²)
+  fwd_tunnel_R2                         0.7685  
+  lat_all_MAE                           0.2072  (m/s²)
+  lat_all_RMSE                          0.5214  (m/s²)
+  lat_all_R2                            0.8430  
+  lat_tunnel_MAE                        0.0330  (m/s²)
+  lat_tunnel_RMSE                       0.0418  (m/s²)
+  lat_tunnel_R2                        -6.1555  

@@ -26,7 +26,7 @@ Automatically detects the underground tunnel and flags those rows as GPS-denied.
 
 ### Step 1 — Launch CARLA
 ```
-C:\Users\heman\Downloads\CARLA_0.9.15\WindowsNoEditor
+cd C:\Users\heman\Downloads\CARLA_0.9.15\WindowsNoEditor
 CarlaUE4.exe -quality-level=Low -windowed -ResX=800 -ResY=600
 ```
 Wait ~30 seconds until the CARLA window fully loads.
@@ -34,7 +34,7 @@ Wait ~30 seconds until the CARLA window fully loads.
 ### Step 2 — Install requirements
 ```
 cd C:\Users\heman\Music\rl_imu_project
-carla_env\Scripts\activate
+carla_env37\Scripts\activate
 pip install -r requirements.txt
 ```
 
