@@ -2,7 +2,18 @@
 # carla_config.py
 # Central configuration for CARLA + RL-EKF Integration
 # All tunable parameters live here — edit this file to customize behavior
+#
+# PATHS are absolute using PROJECT_ROOT derived from this file's location.
+# Previously MODEL_DIR = "models/" was relative to CWD, which resolved
+# correctly from rl_imu_project\ but WRONG from carla_implementation\.
 # =============================================================================
+
+import os
+
+# This file lives in:  rl_imu_project\carla_implementation\carla_config.py
+# PROJECT_ROOT is:     rl_imu_project\
+_HERE        = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(_HERE)
 
 # -----------------------------------------------------------------------------
 # CARLA SERVER CONNECTION
@@ -60,21 +71,23 @@ GNSS_CONFIG = {
 
 # -----------------------------------------------------------------------------
 # GPS DENIAL ZONES
-# Town04 has a real tunnel — we add extra software-denial zones too
-# Format: (x_min, x_max, y_min, y_max) in CARLA world coordinates
+# FIX: Coordinates here are LOCAL EKF frame coords (relative to spawn point),
+# matching collect_data.py which uses TUNNEL_X_MIN/MAX, TUNNEL_Y_MIN/MAX.
+# The old values (-400,-200,10,60) were raw CARLA world coordinates —
+# but GPSDenialManager._check_zones() receives LOCAL coords from carla_to_local().
+# These corrected bounds match collect_data.py's tunnel detection exactly so
+# gps_denied=1 fires at the same positions in both training and RL evaluation.
+# Format: (x_min, x_max, y_min, y_max) in LOCAL EKF frame (metres from spawn)
 # -----------------------------------------------------------------------------
 GPS_DENIAL_ZONES = [
-    # Town04 main tunnel (approximate world coords — auto-detected at runtime too)
-    (-400, -200, 10, 60),
-    # Additional urban canyon / underpass zones
-    (50,   150,  -100, -50),
-    (200,  280,  20,   80),
+    # Town04 main tunnel — matches TUNNEL_X/Y in collect_data.py
+    (-130.0, 140.0, -35.0, 65.0),
 ]
 
 # How to determine GPS denial:
 # "zone"    = purely coordinate-based (above)
-# "tunnel"  = use CARLA's OpenDRIVE tunnel detection
-# "both"    = use both methods (recommended)
+# "tunnel"  = use CARLA's OpenDRIVE tunnel detection (z < -1.0)
+# "both"    = use both methods (recommended — belt and braces)
 GPS_DENIAL_METHOD = "both"
 
 # -----------------------------------------------------------------------------
@@ -107,15 +120,22 @@ WEATHER_PRESETS = [
 USE_LOCAL_COORDS = True           # Convert CARLA world coords to local EKF coords
 
 # -----------------------------------------------------------------------------
-# FILE PATHS
+# FILE PATHS — absolute, correct regardless of which directory you run from
 # -----------------------------------------------------------------------------
-MODEL_DIR   = "models/"
-RESULTS_DIR = "results/"
-LOG_DIR     = "logs/"
+MODEL_DIR   = os.path.join(PROJECT_ROOT, "models")
+RESULTS_DIR = os.path.join(PROJECT_ROOT, "results")
+LOG_DIR     = os.path.join(PROJECT_ROOT, "logs")
 
-BEST_MODEL_PATH     = MODEL_DIR + "best_carla_model.pth"
-LATEST_MODEL_PATH   = MODEL_DIR + "latest_carla_model.pth"
-TRAINING_LOG_PATH   = LOG_DIR   + "carla_training_log.csv"
+BEST_MODEL_PATH     = os.path.join(MODEL_DIR, "best_carla_model.pth")
+LATEST_MODEL_PATH   = os.path.join(MODEL_DIR, "latest_carla_model.pth")
+TRAINING_LOG_PATH   = os.path.join(LOG_DIR,   "carla_training_log.csv")
+
+# LSTM model files — produced by train_lstm.py, consumed by ekf.py LSTMBridge
+LSTM_MODEL_PATH = os.path.join(MODEL_DIR, "lstm_drift_predictor.pth")
+LSTM_STATS_PATH = os.path.join(MODEL_DIR, "lstm_normalisation.npz")
+
+# Gravity constant for IMU correction (matches collect_data.py G = 9.81)
+G = 9.81  # m/s²
 
 # -----------------------------------------------------------------------------
 # VISUALIZATION

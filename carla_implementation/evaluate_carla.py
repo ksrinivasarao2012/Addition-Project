@@ -242,9 +242,14 @@ def plot_comparison(rl_results: List[Dict],
     ax_q.set_title("Q Scale Adaptation (RL Agent)")
     ax_q.set_xlabel("Time (s)"); ax_q.set_ylabel("Q Scale")
     ax_q.legend(fontsize=8); ax_q.grid(True, alpha=0.3)
-    ax_q.annotate("Q increases\nin tunnel →", xy=(denied_time[0] if len(denied_time) > 0 else 0, 1.5),
-                  fontsize=8, color="darkred",
-                  arrowprops=dict(arrowstyle="->", color="darkred"))
+    # Only annotate if tunnel segments exist and xytext can be computed safely.
+    # annotate() with arrowprops REQUIRES xytext — omitting it crashes matplotlib.
+    if len(denied_time) > 0:
+        ax_q.annotate("Q increases in tunnel",
+                      xy=(denied_time[0], 1.5),
+                      xytext=(denied_time[0] + max(steps[-1]*0.05, 1.0), 2.0),
+                      fontsize=8, color="darkred",
+                      arrowprops=dict(arrowstyle="->", color="darkred"))
 
     # ---- 5. R Scale Adaptation ----
     rl_r = np.array([pad_array(r["r_scales"], max_len) for r in rl_results])

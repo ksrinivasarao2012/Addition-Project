@@ -1,5 +1,12 @@
-# rl_imu_project requirements
-# Install with: pip install -r requirements.txt
+# rl_imu_project — Python dependencies
+# Install with:
+#   carla_env37\Scripts\activate
+#   pip install -r requirements.txt
+#
+# CARLA Python package — install separately (not on PyPI):
+#   pip install C:\Users\heman\Downloads\CARLA_0.9.15\WindowsNoEditor\PythonAPI\carla\dist\carla-0.9.15-cp37-cp37m-win_amd64.whl
+#
+# Python 3.7.x is required (CARLA 0.9.15 does not support 3.8+)
 
 numpy>=1.19.0
 torch>=1.9.0

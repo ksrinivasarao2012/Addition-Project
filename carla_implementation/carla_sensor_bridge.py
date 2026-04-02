@@ -60,7 +60,13 @@ class GNSSReading:
     latitude:   float             # Degrees
     longitude:  float             # Degrees
     altitude:   float             # Meters
-    valid:      bool = True       # False when inside GPS denial zone
+    valid:      bool  = True      # False when inside GPS denial zone
+    # FIX 1: declare local_x/local_y as proper dataclass fields.
+    # Previously these were set dynamically via gnss.local_x = lx which
+    # raised AttributeError in any code path that read them before
+    # gnss_to_local() was called (e.g. a stale queue entry).
+    local_x:    float = 0.0       # Converted EKF local-frame X (m)
+    local_y:    float = 0.0       # Converted EKF local-frame Y (m)
 
 
 @dataclass
@@ -71,7 +77,14 @@ class GroundTruth:
     y:          float             # World Y position (meters, local frame)
     heading:    float             # Yaw angle (radians)
     velocity:   float             # Forward speed (m/s)
-    in_tunnel:  bool = False      # Whether vehicle is in a tunnel
+    in_tunnel:  bool  = False     # Whether vehicle is in a tunnel
+    # FIX 2: pitch and roll are required for gravity correction.
+    # collect_data.py calls correct_imu_for_gravity(ax, ay, pitch_deg, roll_deg)
+    # and the LSTM was trained on ax_corr computed with these values.
+    # Without them, carla_rl_environment.py cannot apply the same gravity
+    # correction that was used during LSTM training.
+    pitch_deg:  float = 0.0       # Vehicle pitch (degrees)
+    roll_deg:   float = 0.0       # Vehicle roll  (degrees)
 
 
 @dataclass
@@ -550,6 +563,10 @@ class CARLASensorBridge:
             heading   = heading,
             velocity  = speed,
             in_tunnel = in_tunnel,
+            # FIX 2: supply pitch and roll so carla_rl_environment.py can
+            # apply the same gravity correction used during LSTM training.
+            pitch_deg = transform.rotation.pitch,
+            roll_deg  = transform.rotation.roll,
         )
         self._last_gt = gt
         return gt

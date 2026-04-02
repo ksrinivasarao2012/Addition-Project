@@ -1,4 +1,4 @@
-"""
+r"""
 rl_train.py  —  RL Adaptive Filter Tuning  (Main Training Script)
 ==================================================================
 For: LSTM + RL-Adaptive EKF Localization in CARLA Town04
@@ -70,6 +70,9 @@ import matplotlib.gridspec as gridspec
 # All project files live in rl_imu_project root.
 # carla_implementation files are in the subdirectory.
 # =============================================================================
+import os
+
+# The 'r' prefix tells Python to treat backslashes as literal characters
 ROOT_DIR  = r'C:\Users\heman\Music\rl_imu_project'
 CARLA_DIR = os.path.join(ROOT_DIR, 'carla_implementation')
 

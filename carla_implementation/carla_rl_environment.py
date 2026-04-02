@@ -24,9 +24,30 @@ import logging
 from typing import Tuple, Optional
 
 from carla_sensor_bridge import CARLASensorBridge, SensorBundle
+from carla_config import (
+    FIXED_DELTA_SECONDS, RANDOMIZE_SPAWN, MAX_STEPS,
+    G, LSTM_MODEL_PATH, LSTM_STATS_PATH,
+)
 from carla_config import *
 
 log = logging.getLogger("CARLAEnv")
+
+
+def _correct_imu_for_gravity(ax_raw: float, ay_raw: float,
+                              pitch_deg: float, roll_deg: float):
+    """
+    Remove the gravitational component from raw IMU accelerometer readings.
+    Matches collect_data.py correct_imu_for_gravity() exactly so the values
+    passed to the LSTM bridge are on the same scale as the training data.
+
+    ax_corr = ax_raw + g * sin(pitch)
+    ay_corr = ay_raw - g * sin(roll) * cos(pitch)
+    """
+    pitch_rad = math.radians(pitch_deg)
+    roll_rad  = math.radians(roll_deg)
+    ax_corr   = ax_raw + G * math.sin(pitch_rad)
+    ay_corr   = ay_raw - G * math.sin(roll_rad) * math.cos(pitch_rad)
+    return ax_corr, ay_corr
 
 
 class CARLALocalizationEnv:
@@ -64,6 +85,21 @@ class CARLALocalizationEnv:
         self.episode_r_scales:      list = []
 
         self._last_bundle: Optional[SensorBundle] = None
+
+        # FIX 3a: Instantiate the LSTM bridge so the architecture's
+        # "GPS Ground Truth → LSTM Drift Compensation → KF-LSTM Fusion"
+        # path is active during live RL training — not just offline.
+        # LSTMBridge is defined inside ekf.py and loaded with the same
+        # normalisation stats used during train_lstm.py.
+        from ekf import LSTMBridge
+        self._lstm_bridge = LSTMBridge(
+            model_path=LSTM_MODEL_PATH,
+            stats_path=LSTM_STATS_PATH,
+        )
+        if self._lstm_bridge.loaded():
+            log.info("✓ LSTM bridge loaded — using LSTM drift compensation")
+        else:
+            log.warning("LSTM bridge not loaded — EKF will use raw IMU only")
 
         log.info("Initializing CARLA environment...")
         if not self.bridge.connect():
@@ -117,6 +153,10 @@ class CARLALocalizationEnv:
         self.episode_q_scales.clear()
         self.episode_r_scales.clear()
 
+        # FIX 3b: reset LSTM buffer between episodes so stale features
+        # from the previous episode do not contaminate the first tunnel pass.
+        self._lstm_bridge.reset()
+
         self.ekf.set_noise_scales(self.q_scale, self.r_scale)
 
         obs = self._build_observation(bundle)
@@ -151,11 +191,46 @@ class CARLALocalizationEnv:
             return obs, -10.0, False, {"error": "no_sensor_data"}
         self._last_bundle = bundle
 
-        # 3. EKF predict — u = {'accel': [ax, ay], 'gyro': omega}
+        # 3. EKF predict — apply gravity correction first (matches LSTM training),
+        #    then decide a_fwd source: LSTM during GPS denial, raw IMU on open road.
+        #
+        # FIX 3c: Architecture compliance.
+        # The diagram requires: IMU → gravity correction → LSTM Drift Compensation
+        #                       → KF-LSTM Fusion (AdaptiveEKF.predict)
+        # Previously raw bundle.imu.forward_accel was passed directly,
+        # bypassing both gravity correction and the LSTM entirely.
         dt = FIXED_DELTA_SECONDS
+
+        # Gravity-corrected accelerations (matches collect_data.py & LSTM training)
+        ax_corr, ay_corr = _correct_imu_for_gravity(
+            bundle.imu.forward_accel,
+            bundle.imu.accel_y,
+            bundle.ground_truth.pitch_deg,
+            bundle.ground_truth.roll_deg,
+        )
+
+        # Push to LSTM buffer every tick — open road too — so buffer is warm
+        # when the tunnel starts (same strategy as ekf.py offline evaluation).
+        self._lstm_bridge.push(
+            ax_corr   = ax_corr,
+            ay_corr   = ay_corr,
+            wz        = bundle.imu.yaw_rate,
+            ekf_speed = self.ekf.get_speed(),
+            gps_denied= int(bundle.gps_denied),
+        )
+
+        # Select a_fwd: use LSTM prediction inside tunnel if buffer is ready,
+        # fall back to gravity-corrected IMU otherwise.
+        a_fwd = ax_corr   # default: corrected IMU
+        lstm_active = False
+        if bundle.gps_denied and self._lstm_bridge.ready():
+            a_fwd_lstm, _ = self._lstm_bridge.predict()
+            if a_fwd_lstm is not None:
+                a_fwd       = a_fwd_lstm
+                lstm_active = True
+
         self.ekf.predict(u={
-            'accel': np.array([bundle.imu.forward_accel,
-                               bundle.imu.accel_y]),
+            'accel': np.array([a_fwd, ay_corr]),
             'gyro':  bundle.imu.yaw_rate,
         })
 
@@ -212,6 +287,7 @@ class CARLALocalizationEnv:
             "gt_y":           gt.y,
             "ekf_x":          ekf_x,
             "ekf_y":          ekf_y,
+            "lstm_active":    lstm_active,
         }
 
         return obs, reward, done, info
