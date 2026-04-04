@@ -180,3 +180,18 @@ CarlaUE4.exe -RenderOffScreen -quality-level=Low -opengl
 ```
 
 **Low speed / vehicle stuck** — Reduce `TARGET_SPEED` in `carla_implementation\carla_config.py`.
+
+
+### demo file running
+# Terminal 1
+CarlaUE4.exe -quality-level=Low -windowed -ResX=800 -ResY=600
+
+# Terminal 2
+cd C:\Users\heman\Music\rl_imu_project
+carla_env37\Scripts\activate
+python demo.py
+
+optional flags:
+python demo.py --steps 800      # longer run, more tunnel passes
+python demo.py --no-rl          # show LSTM-EKF without RL (simpler demo)
+python demo.py --no-render      # hide CARLA window, only show dashboard
