@@ -1,14 +1,14 @@
-EKF Localizer v3 — Test Metrics (Run 3)
+EKF Localizer v4 — Test Metrics (Run 3)
 ==============================================================
-Metric                         Baseline    LSTM-EKF   Improvement
+Metric                         Baseline   LSTM-EKF v4   Improvement
 --------------------------------------------------------------
-  Overall RMSE (m)                 20.288      19.807       +2.4%
-  Overall mean (m)                  5.581       5.573       +0.1%
-  Overall max  (m)                172.878     168.281       +2.7%
-  Tunnel RMSE  (m)                 56.945      55.586       +2.4%
-  Tunnel mean  (m)                 33.392      33.313       +0.2%
-  Tunnel max   (m)                172.878     168.281       +2.7%
-  Road RMSE    (m)                  1.689       1.691       -0.1%
-  Road mean    (m)                  1.566       1.568       -0.1%
-  NIS mean                          2.480       2.483       -0.1%
-  NIS inside 95%                   91.474      91.436       +0.0%
+  Overall RMSE (m)                 88.986        89.612       -0.7%
+  Overall mean (m)                 55.769        55.960       -0.3%
+  Overall max  (m)                460.476       467.245       -1.5%
+  Tunnel RMSE  (m)                194.829       196.184       -0.7%
+  Tunnel mean  (m)                149.873       150.641       -0.5%
+  Tunnel max   (m)                460.476       467.245       -1.5%
+  Road RMSE    (m)                 59.843        60.273       -0.7%
+  Road mean    (m)                 42.182        42.290       -0.3%
+  NIS mean                       3604.169      3656.007       -1.4%
+  NIS inside 95%                    6.924         6.904       +0.3%

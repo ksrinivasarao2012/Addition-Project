@@ -1,8 +1,23 @@
 # =============================================================================
-# carla_rl_environment.py  —  fully matched to your ekf.py + rl_agent.py
+# carla_rl_environment.py  —  v4  (two targeted changes from v3)
 #
-# ekf.py signatures:
-#   reset()                          → no args
+# CHANGE 1 — LSTM applied as ADDITIVE BIAS CORRECTION (not replacement)
+#   v3: a_fwd = lstm_output
+#   v4: a_fwd = ax_corr + lstm_output   (bias_fwd predicted by train_lstm v4)
+#
+# CHANGE 2 — OBS_DIM 8 → 10  (two new observation dimensions)
+#   dim 9 (index 8): lstm_disagreement
+#       = |lstm_bias_fwd| / 5.0  (normalised)
+#       Tells PPO how large a correction the LSTM is currently making.
+#       Large disagreement = IMU has significant bias = agent should adjust Q.
+#   dim 10 (index 9): lstm_ready
+#       = 1.0 if LSTMBridge buffer is full, 0.0 otherwise
+#       Tells PPO whether LSTM is actively correcting or still warming up.
+#       Without this, agent cannot distinguish "GPS denied + LSTM active"
+#       from "GPS denied + LSTM still building context window".
+#
+# ekf.py signatures (v4):
+#   reset()
 #   predict(u)                       → u = {'accel':[ax,ay], 'gyro':omega}
 #   update_gps(z)                    → z = np.array([x, y])
 #   set_noise_scales(Q_scale, R_scale)
@@ -11,11 +26,11 @@
 #       'covariance', 'position_uncertainty', 'innovation',
 #       'Q_scale', 'R_scale'
 #
-# rl_agent.py signatures:
+# rl_agent.py signatures (v4):
 #   select_action(obs) → (action, value, log_prob)
 #   store_transition(obs, action, reward, value, log_prob, done)
 #   update(next_obs)   → stats dict
-#   obs_dim = 8  ← agent expects 8-dim obs
+#   obs_dim = 10  ← updated from 8 (requires retraining PPO)
 # =============================================================================
 
 import numpy as np
@@ -36,12 +51,8 @@ log = logging.getLogger("CARLAEnv")
 def _correct_imu_for_gravity(ax_raw: float, ay_raw: float,
                               pitch_deg: float, roll_deg: float):
     """
-    Remove the gravitational component from raw IMU accelerometer readings.
-    Matches collect_data.py correct_imu_for_gravity() exactly so the values
-    passed to the LSTM bridge are on the same scale as the training data.
-
-    ax_corr = ax_raw + g * sin(pitch)
-    ay_corr = ay_raw - g * sin(roll) * cos(pitch)
+    Remove gravitational component from raw IMU.
+    Matches collect_data.py correct_imu_for_gravity() exactly.
     """
     pitch_rad = math.radians(pitch_deg)
     roll_rad  = math.radians(roll_deg)
@@ -52,11 +63,16 @@ def _correct_imu_for_gravity(ax_raw: float, ay_raw: float,
 
 class CARLALocalizationEnv:
     """
-    RL environment wrapping CARLA + EKF.
-    Observation is 8-dim to match PPOAgent(obs_dim=8).
+    RL environment wrapping CARLA + AdaptiveEKF.
+
+    v4 changes:
+      - OBS_DIM = 10  (was 8)
+      - LSTM applied as additive bias: a_fwd = ax_corr + lstm_bias
+      - Two new observation dims: lstm_disagreement, lstm_ready
     """
 
-    OBS_DIM    = 8   # Must match PPOAgent obs_dim=8
+    # CHANGE 2: OBS_DIM 8 → 10
+    OBS_DIM    = 10   # UPDATED — must match PPOAgent obs_dim=10
     ACTION_DIM = 2
 
     Q_SCALE_MIN = 0.1
@@ -86,35 +102,31 @@ class CARLALocalizationEnv:
 
         self._last_bundle: Optional[SensorBundle] = None
 
-        # FIX 3a: Instantiate the LSTM bridge so the architecture's
-        # "GPS Ground Truth → LSTM Drift Compensation → KF-LSTM Fusion"
-        # path is active during live RL training — not just offline.
-        # LSTMBridge is defined inside ekf.py and loaded with the same
-        # normalisation stats used during train_lstm.py.
+        # CHANGE 2 state: track last LSTM output for observation building
+        self._last_lstm_bias_fwd: float = 0.0   # last bias prediction (m/s²)
+        self._lstm_ready:         bool  = False  # is buffer full?
+
+        # Load LSTM bridge (v4 bridge asserts output_is_bias=True in checkpoint)
         from ekf import LSTMBridge
         self._lstm_bridge = LSTMBridge(
             model_path=LSTM_MODEL_PATH,
             stats_path=LSTM_STATS_PATH,
         )
         if self._lstm_bridge.loaded():
-            log.info("✓ LSTM bridge loaded — using LSTM drift compensation")
+            log.info("LSTM bridge v4 loaded — additive bias correction enabled")
         else:
-            log.warning("LSTM bridge not loaded — EKF will use raw IMU only")
+            log.warning("LSTM bridge not loaded — EKF uses raw IMU only")
 
         log.info("Initializing CARLA environment...")
         if not self.bridge.connect():
             raise RuntimeError(
                 "Could not connect to CARLA!\n"
-                "Launch CarlaUE4.exe first, then run training."
-            )
-        log.info("✓ CARLA environment ready")
+                "Launch CarlaUE4.exe first, then run training.")
+        log.info("CARLA environment ready")
 
-    # ------------------------------------------------------------------
-    # RESET
-    # ------------------------------------------------------------------
+    # ── RESET ─────────────────────────────────────────────────────────────────
 
     def reset(self) -> np.ndarray:
-        """Reset for new episode. Returns 8-dim observation."""
         self.episode_count += 1
         log.info(f"Episode {self.episode_count}: resetting...")
 
@@ -126,11 +138,6 @@ class CARLALocalizationEnv:
         if bundle is None:
             raise RuntimeError("No sensor data after reset.")
 
-        # Initialise EKF at local (0,0) — GNSS also outputs (0,0) at spawn.
-        # Use initialize() not direct index access — state layout changed in v2:
-        #   OLD: x[2]=theta, x[3]=v
-        #   NEW: x[2]=v,     x[3]=psi
-        # Direct index access would silently swap heading and velocity.
         self.ekf.initialize(
             x0       = 0.0,
             y0       = 0.0,
@@ -139,7 +146,6 @@ class CARLALocalizationEnv:
             bias0    = 0.0,
         )
 
-        # Reset tracking
         self.q_scale              = 1.0
         self.r_scale              = 1.0
         self.step_count           = 0
@@ -148,15 +154,16 @@ class CARLALocalizationEnv:
         self._gps_denied_steps    = 0
         self._last_bundle         = bundle
 
+        # CHANGE 2: reset LSTM tracking state
+        self._last_lstm_bias_fwd = 0.0
+        self._lstm_ready         = False
+
         self.episode_errors.clear()
         self.episode_tunnel_errors.clear()
         self.episode_q_scales.clear()
         self.episode_r_scales.clear()
 
-        # FIX 3b: reset LSTM buffer between episodes so stale features
-        # from the previous episode do not contaminate the first tunnel pass.
         self._lstm_bridge.reset()
-
         self.ekf.set_noise_scales(self.q_scale, self.r_scale)
 
         obs = self._build_observation(bundle)
@@ -164,103 +171,69 @@ class CARLALocalizationEnv:
                  f"Spawn: ({bundle.ground_truth.x:.1f}, {bundle.ground_truth.y:.1f})")
         return obs
 
-    # ------------------------------------------------------------------
-    # STEP
-    # ------------------------------------------------------------------
+    # ── STEP ──────────────────────────────────────────────────────────────────
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, float, bool, dict]:
-        """Execute one step. Returns (obs, reward, done, info)."""
         self.step_count   += 1
         self._total_steps += 1
 
-        # 1. Clip action to valid range
         delta_q = float(np.clip(action[0], -0.5, 0.5))
         delta_r = float(np.clip(action[1], -0.5, 0.5))
-
-        self.q_scale = float(np.clip(self.q_scale + delta_q,
-                                     self.Q_SCALE_MIN, self.Q_SCALE_MAX))
-        self.r_scale = float(np.clip(self.r_scale + delta_r,
-                                     self.R_SCALE_MIN, self.R_SCALE_MAX))
-
+        self.q_scale = float(np.clip(self.q_scale + delta_q, self.Q_SCALE_MIN, self.Q_SCALE_MAX))
+        self.r_scale = float(np.clip(self.r_scale + delta_r, self.R_SCALE_MIN, self.R_SCALE_MAX))
         self.ekf.set_noise_scales(self.q_scale, self.r_scale)
 
-        # 2. Get sensor data from CARLA
         bundle = self.bridge.get_sensor_bundle()
         if bundle is None:
             obs = self._build_observation(self._last_bundle)
             return obs, -10.0, False, {"error": "no_sensor_data"}
         self._last_bundle = bundle
 
-        # 3. EKF predict — apply gravity correction first (matches LSTM training),
-        #    then decide a_fwd source: LSTM during GPS denial, raw IMU on open road.
-        #
-        # FIX 3c: Architecture compliance.
-        # The diagram requires: IMU → gravity correction → LSTM Drift Compensation
-        #                       → KF-LSTM Fusion (AdaptiveEKF.predict)
-        # Previously raw bundle.imu.forward_accel was passed directly,
-        # bypassing both gravity correction and the LSTM entirely.
-        dt = FIXED_DELTA_SECONDS
-
-        # Gravity-corrected accelerations (matches collect_data.py & LSTM training)
+        # Gravity correction
         ax_corr, ay_corr = _correct_imu_for_gravity(
-            bundle.imu.forward_accel,
-            bundle.imu.accel_y,
-            bundle.ground_truth.pitch_deg,
-            bundle.ground_truth.roll_deg,
+            bundle.imu.forward_accel, bundle.imu.accel_y,
+            bundle.ground_truth.pitch_deg, bundle.ground_truth.roll_deg,
         )
+        wz = bundle.imu.yaw_rate
 
-        # Push to LSTM buffer every tick — open road too — so buffer is warm
-        # when the tunnel starts (same strategy as ekf.py offline evaluation).
-        self._lstm_bridge.push(
-            ax_corr   = ax_corr,
-            ay_corr   = ay_corr,
-            wz        = bundle.imu.yaw_rate,
-            ekf_speed = self.ekf.get_speed(),
-            gps_denied= int(bundle.gps_denied),
-        )
+        # Push to LSTM buffer every tick (open road too — keeps buffer warm)
+        self._lstm_bridge.push(ax_corr, ay_corr, wz, self.ekf.get_speed(), int(bundle.gps_denied))
+        self._lstm_ready = self._lstm_bridge.ready()
 
-        # Select a_fwd: use LSTM prediction inside tunnel if buffer is ready,
-        # fall back to gravity-corrected IMU otherwise.
-        a_fwd = ax_corr   # default: corrected IMU
+        # CHANGE 1: ADDITIVE BIAS CORRECTION
+        # a_fwd = ax_corr (IMU baseline, always)
+        # If GPS denied and LSTM ready, add the predicted bias correction
+        a_fwd      = ax_corr    # default: raw corrected IMU
         lstm_active = False
         if bundle.gps_denied and self._lstm_bridge.ready():
-            a_fwd_lstm, _ = self._lstm_bridge.predict()
-            if a_fwd_lstm is not None:
-                a_fwd       = a_fwd_lstm
+            bias_fwd, _ = self._lstm_bridge.predict()
+            if bias_fwd is not None:
+                a_fwd = ax_corr + bias_fwd   # ADDITIVE — not replacement
+                self._last_lstm_bias_fwd = bias_fwd
                 lstm_active = True
 
+        # EKF predict using corrected acceleration
         self.ekf.predict(u={
             'accel': np.array([a_fwd, ay_corr]),
-            'gyro':  bundle.imu.yaw_rate,
+            'gyro':  wz,
         })
 
-        # 4. EKF update — only when GPS available
+        # EKF update when GPS available
         if bundle.gnss is not None and not bundle.gps_denied:
-            self.ekf.update_gps(z=np.array([bundle.gnss.local_x,
-                                            bundle.gnss.local_y]))
+            self.ekf.update_gps(z=np.array([bundle.gnss.local_x, bundle.gnss.local_y]))
             self.time_since_gps = 0.0
         else:
-            self.time_since_gps += dt
+            self.time_since_gps += FIXED_DELTA_SECONDS
             self._gps_denied_steps += 1
 
-        # 5. Compute position error
-        # get_state() returns dict — position is at key 'position'
         state   = self.ekf.get_state()
-        ekf_pos = state['position']      # np.array([x, y])
-        ekf_x   = float(ekf_pos[0])
-        ekf_y   = float(ekf_pos[1])
+        ekf_pos = state['position']
+        ekf_x   = float(ekf_pos[0]); ekf_y = float(ekf_pos[1])
         gt      = bundle.ground_truth
+        position_error = math.sqrt((ekf_x - gt.x)**2 + (ekf_y - gt.y)**2)
 
-        position_error = math.sqrt(
-            (ekf_x - gt.x) ** 2 +
-            (ekf_y - gt.y) ** 2
-        )
+        reward = self._compute_reward(position_error, bundle.gps_denied, delta_q, delta_r)
 
-        # 6. Reward
-        reward = self._compute_reward(position_error, bundle.gps_denied,
-                                      delta_q, delta_r)
-
-        # 7. Log
         self.episode_errors.append(position_error)
         self.episode_q_scales.append(self.q_scale)
         self.episode_r_scales.append(self.r_scale)
@@ -268,13 +241,9 @@ class CARLALocalizationEnv:
             self.episode_tunnel_errors.append(position_error)
         self._prev_position_error = position_error
 
-        # 8. Done check
         done = self._check_done(position_error, bundle)
+        obs  = self._build_observation(bundle, ekf_state=state)
 
-        # 9. Next observation
-        obs = self._build_observation(bundle, ekf_state=state)
-
-        # 10. Info
         info = {
             "position_error": position_error,
             "gps_denied":     bundle.gps_denied,
@@ -289,25 +258,28 @@ class CARLALocalizationEnv:
             "ekf_y":          ekf_y,
             "lstm_active":    lstm_active,
         }
-
         return obs, reward, done, info
 
-    # ------------------------------------------------------------------
-    # OBSERVATION  (8-dim to match PPOAgent obs_dim=8)
-    # ------------------------------------------------------------------
+    # ── OBSERVATION  (10-dim) ─────────────────────────────────────────────────
 
     def _build_observation(self, bundle: SensorBundle,
                            ekf_state: dict = None) -> np.ndarray:
         """
-        8-dim observation vector matching PPOAgent(obs_dim=8):
-          [0] innovation_x          (from ekf state['innovation'][0])
-          [1] innovation_y          (from ekf state['innovation'][1])
-          [2] position_uncertainty  (from ekf state['position_uncertainty'])
-          [3] time_since_gps        (normalized 0-1)
-          [4] q_scale               (normalized 0-1)
-          [5] r_scale               (normalized 0-1)
-          [6] gps_denied flag       (0 or 1)
-          [7] vehicle speed         (normalized 0-1, max 30 m/s)
+        10-dim observation vector:
+
+          [0]  innovation_x          normalised to [-1, 1]
+          [1]  innovation_y          normalised to [-1, 1]
+          [2]  position_uncertainty  normalised to [0, 1]
+          [3]  time_since_gps        normalised to [0, 1]
+          [4]  q_scale               normalised to [0, 1]
+          [5]  r_scale               normalised to [0, 1]
+          [6]  gps_denied flag       0 or 1
+          [7]  vehicle speed         normalised to [0, 1]
+          [8]  lstm_disagreement     |lstm_bias_fwd| / 5.0, clipped [0, 1]
+               Tells agent how large a correction LSTM is making.
+               Large = IMU has significant bias → agent may want to adjust Q.
+          [9]  lstm_ready            1.0 if buffer full (LSTM active), else 0.0
+               Tells agent whether LSTM is actually correcting or still warming up.
         """
         if ekf_state is None:
             ekf_state = self.ekf.get_state()
@@ -316,89 +288,60 @@ class CARLALocalizationEnv:
         innov_x     = float(innovation[0]) if len(innovation) > 0 else 0.0
         innov_y     = float(innovation[1]) if len(innovation) > 1 else 0.0
         uncertainty = float(ekf_state.get('position_uncertainty', 0.0))
-
         gt_velocity = bundle.ground_truth.velocity if bundle else 0.0
         gps_denied  = float(bundle.gps_denied) if bundle else 0.0
 
+        # CHANGE 2: new dims 8 and 9
+        # Disagreement = how large is the LSTM correction currently?
+        # 5.0 m/s² is a conservative normalisation scale for IMU bias.
+        lstm_disagreement = abs(self._last_lstm_bias_fwd) / 5.0
+        lstm_ready        = 1.0 if self._lstm_ready else 0.0
+
         obs = np.array([
-            np.clip(innov_x     / 10.0,  -1.0, 1.0),
-            np.clip(innov_y     / 10.0,  -1.0, 1.0),
-            np.clip(uncertainty / 20.0,   0.0, 1.0),
-            np.clip(self.time_since_gps / 30.0, 0.0, 1.0),
-            (self.q_scale - self.Q_SCALE_MIN) / (self.Q_SCALE_MAX - self.Q_SCALE_MIN),
-            (self.r_scale - self.R_SCALE_MIN) / (self.R_SCALE_MAX - self.R_SCALE_MIN),
-            gps_denied,
-            np.clip(gt_velocity / 30.0,   0.0, 1.0),
+            np.clip(innov_x / 10.0,     -1.0, 1.0),   # [0]
+            np.clip(innov_y / 10.0,     -1.0, 1.0),   # [1]
+            np.clip(uncertainty / 20.0,  0.0, 1.0),   # [2]
+            np.clip(self.time_since_gps / 30.0, 0.0, 1.0),  # [3]
+            (self.q_scale - self.Q_SCALE_MIN) / (self.Q_SCALE_MAX - self.Q_SCALE_MIN),  # [4]
+            (self.r_scale - self.R_SCALE_MIN) / (self.R_SCALE_MAX - self.R_SCALE_MIN),  # [5]
+            gps_denied,                                # [6]
+            np.clip(gt_velocity / 30.0,  0.0, 1.0),  # [7]
+            np.clip(lstm_disagreement,   0.0, 1.0),  # [8] NEW
+            lstm_ready,                                # [9] NEW
         ], dtype=np.float32)
 
         return obs
 
-    # ------------------------------------------------------------------
-    # REWARD
-    # ------------------------------------------------------------------
+    # ── REWARD  (unchanged from v3) ───────────────────────────────────────────
 
     def _compute_reward(self, position_error: float, in_tunnel: bool,
                         delta_q: float, delta_r: float) -> float:
-        """
-        Normalized reward so episode returns are human-readable.
-
-        Design:
-          +1.0  if position error = 0m  (perfect)
-           0.0  if position error = 5m  (acceptable)
-          -1.0  if position error = 10m (bad)
-          -2.0  if position error = 15m+ (very bad)
-
-        This keeps episode returns in roughly [-500, +500] range
-        instead of the raw [-5000, 0] range from -position_error.
-        """
-        # Normalize: map error to [-2, +1] range
-        # 5m error = 0 reward (breakeven point)
-        normalized = (5.0 - position_error) / 5.0
-        normalized = float(np.clip(normalized, -2.0, 1.0))
-
-        # Tunnel bonus: correct behavior during GPS denial is worth more
+        normalized  = (5.0 - position_error) / 5.0
+        normalized  = float(np.clip(normalized, -2.0, 1.0))
         if in_tunnel:
             normalized *= 1.5
-
-        # Improvement bonus: reward getting better vs last step
         improvement = (self._prev_position_error - position_error) / 5.0
         normalized += 0.3 * float(np.clip(improvement, -1.0, 1.0))
-
-        # Smoothness: small penalty for thrashing Q/R
         normalized -= 0.05 * (abs(delta_q) + abs(delta_r))
-
         return float(np.clip(normalized, -3.0, 2.0))
 
-    # ------------------------------------------------------------------
-    # TERMINATION
-    # ------------------------------------------------------------------
+    # ── TERMINATION  (unchanged) ──────────────────────────────────────────────
 
-    def _check_done(self, position_error: float,
-                    bundle: SensorBundle) -> bool:
-        if self.step_count >= MAX_STEPS:
-            log.info(f"Episode ended: max steps ({MAX_STEPS})")
-            return True
-        if position_error > 100.0:
-            log.warning(f"Episode ended: EKF diverged ({position_error:.1f}m)")
-            return True
-        if self._vehicle_is_stuck(bundle):
-            log.info("Episode ended: vehicle stuck")
-            return True
+    def _check_done(self, position_error: float, bundle: SensorBundle) -> bool:
+        if self.step_count >= MAX_STEPS:        return True
+        if position_error > 100.0:              return True
+        if self._vehicle_is_stuck(bundle):      return True
         return False
 
     def _vehicle_is_stuck(self, bundle: SensorBundle) -> bool:
         return bundle.ground_truth.velocity < 0.5 and self.step_count > 50
 
-    # ------------------------------------------------------------------
-    # SUMMARY
-    # ------------------------------------------------------------------
+    # ── SUMMARY  (unchanged) ─────────────────────────────────────────────────
 
     def get_episode_summary(self) -> dict:
-        if not self.episode_errors:
-            return {}
+        if not self.episode_errors: return {}
         errors = np.array(self.episode_errors)
-        t_errs = np.array(self.episode_tunnel_errors) \
-                 if self.episode_tunnel_errors else np.array([0.0])
+        t_errs = np.array(self.episode_tunnel_errors) if self.episode_tunnel_errors else np.array([0.0])
         return {
             "episode":           self.episode_count,
             "steps":             self.step_count,
@@ -415,8 +358,5 @@ class CARLALocalizationEnv:
         self.bridge.destroy()
         log.info("CARLA environment closed.")
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.close()
+    def __enter__(self):  return self
+    def __exit__(self, *args): self.close()

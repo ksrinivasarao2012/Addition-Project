@@ -1,4 +1,4 @@
-"""
+r"""
 demo.py  —  Live CARLA Demonstration
 =====================================
 For: LSTM + RL-Adaptive EKF Localization Project
@@ -332,8 +332,7 @@ class LiveDashboard:
                     ha='center', va='center', transform=ax.transAxes,
                     fontsize=13, fontweight='bold', color=val_color)
 
-        nan_str = lambda v, fmt=':.2f': (f'{v{fmt}}' if not
-                                          (v != v) else 'n/a')
+            nan_str = lambda v, fmt=':.2f': (f'{v:{fmt[1:]}}' if not (v != v) else 'n/a')
 
         t_ekf_s  = f'{t_ekf:.2f} m'  if not math.isnan(t_ekf)  else 'n/a'
         t_base_s = f'{t_base:.2f} m' if not math.isnan(t_base) else 'n/a'
@@ -405,7 +404,7 @@ def run_demo(args):
     rl_agent = None
     if not args.no_rl:
         if os.path.isfile(BEST_MODEL_PATH):
-            rl_agent = PPOAgent(obs_dim=8, action_dim=2)
+            rl_agent = PPOAgent(obs_dim=10, action_dim=2)
             rl_agent.load(BEST_MODEL_PATH)
             log.info(f'RL agent loaded from {BEST_MODEL_PATH}')
         else:

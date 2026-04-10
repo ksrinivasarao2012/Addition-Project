@@ -279,7 +279,8 @@ def train(args):
     # ── Initialize PPO Agent ──────────────────────────────────────────────────
     # obs_dim=8 must match CARLALocalizationEnv.OBS_DIM
     # action_dim=2: [delta_Q_scale, delta_R_scale]
-    agent = PPOAgent(obs_dim=8, action_dim=2)
+    agent = PPOAgent(obs_dim=10, action_dim=2)
+    
 
     if args.resume and os.path.exists(args.resume):
         agent.load(args.resume)
